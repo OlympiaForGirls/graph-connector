@@ -1,0 +1,5 @@
+{
+  "installCommand": "cd graph-connector && npm install",
+  "buildCommand": "cd graph-connector && npm run build",
+  "outputDirectory": "graph-connector/dist"
+}
