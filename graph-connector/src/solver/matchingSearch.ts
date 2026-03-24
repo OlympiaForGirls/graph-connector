@@ -51,7 +51,7 @@
 import type { Graph, CrossEdge, EdgeColor } from '../types/graph';
 import type { SolutionSnapshot, ConnectionSnapshot } from '../types/solution';
 import { buildUnifiedAdjList, findAllCycles } from '../utils/cycleDetection';
-import { canonicalRotation, hasMirrorSymmetry } from '../validation/cycleAnalysis';
+import { canonicalRotation, dihedralCanonical, hasMirrorSymmetry } from '../validation/cycleAnalysis';
 
 /** Generations above this value are blocked in Search Mode. */
 export const MAX_SEARCH_GEN = 3;
@@ -185,7 +185,7 @@ function validateCompleteMatching(
 
   const seen = new Set<string>();
   for (const c of cycles) {
-    const fp = canonicalRotation(c.colors).join(',');
+    const fp = dihedralCanonical(c.colors);   // Rule B: rotation + reflection equiv.
     if (seen.has(fp)) return false;
     seen.add(fp);
   }
@@ -323,9 +323,19 @@ export function runSearch(
         if (color === topForbidColor || color === botForbidColor) continue;
 
         partialStatesExplored++;
+        // Milestone: emit every PROGRESS_INTERVAL states.
         if (partialStatesExplored % PROGRESS_INTERVAL === 0) {
           emitProgress();
           lastProgressEmitTime = Date.now();
+        } else if (partialStatesExplored % 10 === 0) {
+          // Time-based fallback checked every 10 states so that gen≥4 searches
+          // (where each findNewCycleColors call can be slow) still emit progress
+          // even if the outer stepCount check rarely fires.
+          const nowInner = Date.now();
+          if (nowInner - lastProgressEmitTime >= PROGRESS_INTERVAL_MS) {
+            emitProgress();
+            lastProgressEmitTime = nowInner;
+          }
         }
 
         // ── Layer 2: incremental cycle check ─────────────────
@@ -335,7 +345,7 @@ export function runSearch(
         let pruned              = false;
 
         for (const seq of newCycleSeqs) {
-          const fp = canonicalRotation(seq).join(',');
+          const fp = dihedralCanonical(seq);  // Rule B: rotation + reflection equiv.
           // Rule B: fingerprint must be new among all cycles on this path.
           if (seenFingerprints.has(fp) || newFpSet.has(fp)) { pruned = true; break; }
           // Rule C: even-length mirror-symmetric cycle is forbidden.

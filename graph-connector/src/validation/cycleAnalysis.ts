@@ -27,11 +27,8 @@ export function colorSequence(cycle: Cycle): EdgeColor[] {
 
 /**
  * Returns the lexicographically smallest cyclic rotation of `seq`.
- * This is the canonical form used to decide rotation equivalence.
- *
- * ASSUMPTION: rotation-equivalence = "one is a cyclic shift of the other."
- * Reflection is intentionally NOT included here (that is Rule C's concern).
- * Adjust this function to change the equivalence definition.
+ * Forward rotations ONLY — used by hasMirrorSymmetry (Rule C) and for display.
+ * For Rule B duplicate detection use dihedralCanonical instead.
  */
 export function canonicalRotation(seq: EdgeColor[]): EdgeColor[] {
   if (seq.length === 0) return [];
@@ -40,6 +37,34 @@ export function canonicalRotation(seq: EdgeColor[]): EdgeColor[] {
     const rot = [...seq.slice(i), ...seq.slice(0, i)];
     if (rot.join(',') < best.join(',')) best = rot;
   }
+  return best;
+}
+
+/**
+ * Returns the lexicographically smallest element among all cyclic rotations of
+ * `seq` AND all cyclic rotations of the reversed sequence.
+ *
+ * This is the dihedral canonical form: two sequences map to the same string iff
+ * one can be obtained from the other by cyclic rotation OR reversal (i.e., they
+ * represent the same undirected cycle traversed in either direction).
+ *
+ * ASSUMPTION for Rule B: a cycle traversed clockwise equals the same cycle
+ * traversed counterclockwise — only the edge SET and relative order matter,
+ * not the direction of traversal.
+ */
+export function dihedralCanonical(seq: EdgeColor[]): string {
+  if (seq.length === 0) return '';
+  const rev = [...seq].reverse();
+  let best = seq.join(',');
+  for (let i = 1; i < seq.length; i++) {
+    const fwd = [...seq.slice(i), ...seq.slice(0, i)].join(',');
+    if (fwd < best) best = fwd;
+    const bwd = [...rev.slice(i), ...rev.slice(0, i)].join(',');
+    if (bwd < best) best = bwd;
+  }
+  // also compare rotation-0 of rev
+  const rev0 = rev.join(',');
+  if (rev0 < best) best = rev0;
   return best;
 }
 
@@ -102,8 +127,10 @@ export function analyzeCycles(
   anyMirrorViolation: boolean;
 } {
   // Seed the seen-patterns set with all existing cycle color fingerprints.
+  // Uses dihedralCanonical so that a cycle traversed in reverse is treated
+  // as the same pattern (Rule B: rotation OR reflection equivalence).
   const seenPatterns = new Set<string>(
-    existingCycles.map(c => canonicalRotation(c.colors).join(','))
+    existingCycles.map(c => dihedralCanonical(c.colors))
   );
 
   const analyses: CycleAnalysis[] = [];
@@ -111,12 +138,12 @@ export function analyzeCycles(
   let anyMirrorViolation   = false;
 
   for (const cycle of newCycles) {
-    const colorSeq     = colorSequence(cycle);
-    const normalizedSeq = canonicalRotation(colorSeq);
-    const fingerprint  = normalizedSeq.join(',');
-    const isEven       = cycle.nodes.length % 2 === 0;
+    const colorSeq      = colorSequence(cycle);
+    const normalizedSeq = canonicalRotation(colorSeq);   // forward-only, for display
+    const fingerprint   = dihedralCanonical(colorSeq);   // dihedral, for Rule B check
+    const isEven        = cycle.nodes.length % 2 === 0;
 
-    // Rule B: check rotation duplicate.
+    // Rule B: check rotation/reflection duplicate.
     const rejectedForRotation = seenPatterns.has(fingerprint);
     // Register this pattern so subsequent new cycles are checked against it too.
     seenPatterns.add(fingerprint);
