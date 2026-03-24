@@ -58,8 +58,14 @@ export const MAX_SEARCH_GEN = 3;
 
 const COLORS: EdgeColor[] = ['red', 'green', 'blue'];
 
-/** Poll shouldStop / emit progress every N DFS steps. */
+/** Poll shouldStop / check timeout every N DFS steps. */
 const STOP_CHECK_INTERVAL = 200;
+
+/** Emit a progress update every N partial states explored. */
+const PROGRESS_INTERVAL = 1000;
+
+/** Time-based fallback: emit at least every this many ms even if partialStates is low. */
+const PROGRESS_INTERVAL_MS = 500;
 
 /**
  * Maximum simple paths searched per newly added cross-edge when looking for
@@ -246,6 +252,7 @@ export function runSearch(
   let stopped  = false;
   let timedOut = false;
   let stepCount = 0;
+  let lastProgressEmitTime = Date.now();
 
   function emitProgress(done = false) {
     onProgress({
@@ -270,7 +277,12 @@ export function runSearch(
     if (stepCount % STOP_CHECK_INTERVAL === 0) {
       if (shouldStop()) { stopped = true; return; }
       if (Date.now() - startTime > safetyTimeLimitMs) { timedOut = true; return; }
-      emitProgress();
+      // Time-based fallback: emit progress if no partial-state milestone was hit recently.
+      const now = Date.now();
+      if (now - lastProgressEmitTime >= PROGRESS_INTERVAL_MS) {
+        emitProgress();
+        lastProgressEmitTime = now;
+      }
     }
 
     // Layer 3: memoisation guard.
@@ -311,6 +323,10 @@ export function runSearch(
         if (color === topForbidColor || color === botForbidColor) continue;
 
         partialStatesExplored++;
+        if (partialStatesExplored % PROGRESS_INTERVAL === 0) {
+          emitProgress();
+          lastProgressEmitTime = Date.now();
+        }
 
         // ── Layer 2: incremental cycle check ─────────────────
         const newCycleSeqs = findNewCycleColors(adj, topNode.id, botNode.id, color);

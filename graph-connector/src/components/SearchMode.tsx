@@ -60,8 +60,11 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
   const [running, setRunning]       = useState(false);
   const [progress, setProgress]     = useState<SearchProgress | null>(null);
   const [searchMode, setSearchMode] = useState<SearchMode>('all');
-  const workerRef = useRef<Worker | null>(null);
-  const importRef = useRef<HTMLInputElement>(null);
+  const workerRef      = useRef<Worker | null>(null);
+  const importRef      = useRef<HTMLInputElement>(null);
+  // Ref keeps the latest progress snapshot synchronously so handleStop
+  // can read it even if React hasn't committed the most recent setProgress yet.
+  const lastProgressRef = useRef<SearchProgress | null>(null);
 
   const topFrontierCount = topGraph.nodes.filter(n => n.isFrontier).length;
   const botFrontierCount = bottomGraph.nodes.filter(n => n.isFrontier).length;
@@ -81,6 +84,7 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
   useEffect(() => {
     workerRef.current?.terminate();
     workerRef.current = null;
+    lastProgressRef.current = null;
     setRunning(false);
     setSolutions(loadFiltered());
     setProgress(null);
@@ -96,6 +100,7 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
     setSolutions([]);
     setRunning(true);
     setProgress(null);
+    lastProgressRef.current = null;
 
     clearSolutionsForGen(gen);
 
@@ -118,7 +123,9 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
           setSolutions(prev => [...prev, sol]);
         }
       } else if (type === 'PROGRESS') {
-        setProgress((e.data as { type: string; progress: SearchProgress }).progress);
+        const p = (e.data as { type: string; progress: SearchProgress }).progress;
+        lastProgressRef.current = p;   // synchronous — always reflects latest received
+        setProgress(p);
       } else if (type === 'DONE') {
         const { solutions: finalSols, progress: finalProgress } =
           (e.data as { type: string; result: SearchResult }).result;
@@ -153,9 +160,12 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
       appendSolutions(prev);
       return prev;
     });
-    setProgress(prev =>
-      prev
-        ? { ...prev, stopped: true, done: false, exhausted: false }
+    // Read from the ref — synchronously reflects the last received PROGRESS message,
+    // bypassing any React state batching delay that might leave progress as null.
+    const last = lastProgressRef.current;
+    setProgress(
+      last
+        ? { ...last, stopped: true, done: false, exhausted: false }
         : { partialStatesExplored: 0, completeMatchingsEvaluated: 0,
             validSolutionsFound: 0, stopped: true, timedOut: false,
             done: false, exhausted: false },
