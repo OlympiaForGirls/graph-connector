@@ -61,11 +61,8 @@ const COLORS: EdgeColor[] = ['red', 'green', 'blue'];
 /** Poll shouldStop / check timeout every N DFS steps. */
 const STOP_CHECK_INTERVAL = 200;
 
-/** Emit a progress update every N partial states explored. */
-const PROGRESS_INTERVAL = 1000;
-
-/** Time-based fallback: emit at least every this many ms even if partialStates is low. */
-const PROGRESS_INTERVAL_MS = 500;
+/** Minimum ms between progress emissions (wall-clock gate). */
+const PROGRESS_INTERVAL_MS = 200;
 
 /**
  * Maximum simple paths searched per newly added cross-edge when looking for
@@ -323,14 +320,10 @@ export function runSearch(
         if (color === topForbidColor || color === botForbidColor) continue;
 
         partialStatesExplored++;
-        // Milestone: emit every PROGRESS_INTERVAL states.
-        if (partialStatesExplored % PROGRESS_INTERVAL === 0) {
-          emitProgress();
-          lastProgressEmitTime = Date.now();
-        } else if (partialStatesExplored % 10 === 0) {
-          // Time-based fallback checked every 10 states so that gen≥4 searches
-          // (where each findNewCycleColors call can be slow) still emit progress
-          // even if the outer stepCount check rarely fires.
+        // Emit progress at most once per PROGRESS_INTERVAL_MS.
+        // Checking Date.now() every state is cheap; this guarantees live updates
+        // regardless of how fast or slow each findNewCycleColors call is.
+        {
           const nowInner = Date.now();
           if (nowInner - lastProgressEmitTime >= PROGRESS_INTERVAL_MS) {
             emitProgress();
@@ -377,6 +370,7 @@ export function runSearch(
     }
   }
 
+  emitProgress();   // confirm worker started; shows 0/0/0 immediately
   dfs(0);
   emitProgress(true);
 
