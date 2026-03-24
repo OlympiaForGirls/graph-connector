@@ -99,7 +99,12 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
 
     setSolutions([]);
     setRunning(true);
-    setProgress(null);
+    // Initialise to zeros immediately so the counter is visible from the first frame,
+    // even for fast gens where the first PROGRESS message might be delayed.
+    setProgress({
+      partialStatesExplored: 0, completeMatchingsEvaluated: 0, validSolutionsFound: 0,
+      stopped: false, timedOut: false, done: false, exhausted: false,
+    });
     lastProgressRef.current = null;
 
     clearSolutionsForGen(gen);
