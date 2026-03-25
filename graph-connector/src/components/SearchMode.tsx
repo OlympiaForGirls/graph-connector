@@ -60,6 +60,7 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
   const [running, setRunning]       = useState(false);
   const [progress, setProgress]     = useState<SearchProgress | null>(null);
   const [searchMode, setSearchMode] = useState<SearchMode>('all');
+  const [workerError, setWorkerError] = useState<string | null>(null);
   const workerRef      = useRef<Worker | null>(null);
   const importRef      = useRef<HTMLInputElement>(null);
   // Ref keeps the latest progress snapshot synchronously so handleStop
@@ -99,6 +100,7 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
 
     setSolutions([]);
     setRunning(true);
+    setWorkerError(null);
     // Initialise to zeros immediately so the counter is visible from the first frame,
     // even for fast gens where the first PROGRESS message might be delayed.
     setProgress({
@@ -141,10 +143,17 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
         setProgress(finalProgress);
         setRunning(false);
         workerRef.current = null;
+      } else if (type === 'ERROR') {
+        const msg = (e.data as { type: string; message: string }).message;
+        setWorkerError(msg);
+        setRunning(false);
+        workerRef.current = null;
       }
+      // ACK is informational only — no state change needed.
     };
 
-    worker.onerror = () => {
+    worker.onerror = (ev: ErrorEvent) => {
+      setWorkerError(ev.message || 'Unknown worker error');
       setRunning(false);
       workerRef.current = null;
     };
@@ -306,6 +315,13 @@ export default function SearchMode({ gen, topGraph, bottomGraph, onLoadSolution 
           onChange={handleImport}
         />
       </div>
+
+      {/* Worker error */}
+      {workerError && (
+        <p className="search-frontier-error">
+          Worker error: {workerError}
+        </p>
+      )}
 
       {/* Progress — live during run and after completion */}
       {progress && !progress.unequalCounts && (

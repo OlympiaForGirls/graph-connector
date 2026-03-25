@@ -10,13 +10,21 @@ import GraphView, { EDGE_COLORS } from './components/GraphView';
 import ColorPicker from './components/ColorPicker';
 import GenSelector from './components/GenSelector';
 import SearchMode from './components/SearchMode';
+import PartialSearch from './components/PartialSearch';
+import CompleteFromPartial from './components/CompleteFromPartial';
+import DebugValidation from './components/DebugValidation';
+import AuditMode from './components/AuditMode';
+import RandomSearch from './components/RandomSearch';
 import { generateGraph, computeSvgDimensions, LEVEL_HEIGHT } from './generation/graphGenerator';
 import { useGraphInteraction } from './hooks/useGraphInteraction';
 import { validateMove } from './validation/validateMove';
 import type { ValidationResult } from './validation/validateMove';
 import type { CycleAnalysis } from './validation/cycleAnalysis';
+import { validateGraph } from './validation/validateGraph';
+import type { GraphValidationResult } from './validation/validateGraph';
 import type { CrossEdge } from './types/graph';
 import type { ConnectionSnapshot } from './types/solution';
+import type { PartialPattern } from './types/partial';
 import './index.css';
 
 // ── CrossEdgeLayer ─────────────────────────────────────────────────────────
@@ -99,9 +107,12 @@ function CycleAnalysisRow({ a }: { a: CycleAnalysis }) {
 // ── App ────────────────────────────────────────────────────────────────────
 export default function App() {
   const [gen, setGen]               = useState(2);
-  const [mode, setMode]             = useState<'manual' | 'search'>('manual');
+  const [mode, setMode]             = useState<'manual' | 'search' | 'partial' | 'complete' | 'audit' | 'random'>('manual');
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [showCycles, setShowCycles] = useState(true);
+  const [selectedPartial, setSelectedPartial] = useState<PartialPattern | null>(null);
+  const [debugResult, setDebugResult] = useState<GraphValidationResult | null>(null);
+  const [showDebug, setShowDebug] = useState(false);
 
   const {
     selectedNode, crossEdges, pendingColor,
@@ -196,11 +207,21 @@ export default function App() {
   }, [selectedNode, crossEdges, pendingColor, topGraph, bottomGraph,
       allNodes, handleNodeClick, clearSelection, createEdge]);
 
-  const handleReset  = useCallback(() => { reset();  setValidation(null); }, [reset]);
+  const handleReset  = useCallback(() => { reset(); setValidation(null); setDebugResult(null); }, [reset]);
   const handleRemove = useCallback(
-    (id: string) => { removeCrossEdge(id); setValidation(null); },
+    (id: string) => { removeCrossEdge(id); setValidation(null); setDebugResult(null); },
     [removeCrossEdge],
   );
+
+  const handleDebugValidate = useCallback(() => {
+    setDebugResult(validateGraph(topGraph, bottomGraph, crossEdges));
+  }, [topGraph, bottomGraph, crossEdges]);
+
+  // Transfer a partial pattern from Partial Search to Complete From Partial.
+  const handleSelectPartial = useCallback((p: PartialPattern) => {
+    setSelectedPartial(p);
+    setMode('complete');
+  }, []);
 
   // Load a solution from Search Mode: apply edges and switch to Manual tab.
   const handleLoadSolution = useCallback((connections: ConnectionSnapshot[]) => {
@@ -285,10 +306,25 @@ export default function App() {
           className={`mode-tab${mode === 'search' ? ' mode-tab--active' : ''}`}
           onClick={() => setMode('search')}
         >Search Mode</button>
+        <button
+          className={`mode-tab${mode === 'partial' ? ' mode-tab--active' : ''}`}
+          onClick={() => setMode('partial')}
+        >Partial Search</button>
+        <button
+          className={`mode-tab${mode === 'complete' ? ' mode-tab--active' : ''}`}
+          onClick={() => setMode('complete')}
+        >Complete From Partial</button>
+        <button
+          className={`mode-tab${mode === 'audit' ? ' mode-tab--active' : ''}`}
+          onClick={() => setMode('audit')}
+        >Audit</button>
+        <button
+          className={`mode-tab${mode === 'random' ? ' mode-tab--active' : ''}`}
+          onClick={() => setMode('random')}
+        >Random Search</button>
       </div>
 
-      {/* Both panels are always mounted so a running search survives tab switches.
-          Visibility is toggled via display:none. */}
+      {/* All panels always mounted; visibility toggled via display:none. */}
       <aside className="status-panel" style={mode !== 'manual' ? { display: 'none' } : {}}>
         <h3>Status</h3>
 
@@ -325,7 +361,7 @@ export default function App() {
           </>
         )}
 
-        {validation && (
+        {validation && !validation.allowed && (
           <div className="cycle-section">
             <button className="cycle-toggle" onClick={() => setShowCycles(v => !v)}>
               New cycles from last move ({validation.newCycleAnalyses.length}){' '}
@@ -344,11 +380,68 @@ export default function App() {
             )}
           </div>
         )}
+
+        <div className="dbg-section">
+          <button
+            className="dbg-run-btn"
+            onClick={() => { handleDebugValidate(); setShowDebug(true); }}
+          >
+            Validate Graph (debug)
+          </button>
+          {debugResult && (
+            <button
+              className="cycle-toggle dbg-toggle"
+              onClick={() => setShowDebug(v => !v)}
+            >
+              {debugResult.valid ? '✓ Valid' : '✗ Invalid'}{' '}
+              {showDebug ? '▲' : '▼'}
+            </button>
+          )}
+          {showDebug && debugResult && (
+            <DebugValidation result={debugResult} crossEdges={crossEdges} />
+          )}
+        </div>
       </aside>
 
       <aside className="status-panel search-panel" style={mode !== 'search' ? { display: 'none' } : {}}>
         <h3>Search Mode</h3>
         <SearchMode
+          gen={gen}
+          topGraph={topGraph}
+          bottomGraph={bottomGraph}
+          onLoadSolution={handleLoadSolution}
+        />
+      </aside>
+
+      <aside className="status-panel search-panel" style={mode !== 'partial' ? { display: 'none' } : {}}>
+        <h3>Partial Search</h3>
+        <PartialSearch
+          gen={gen}
+          topGraph={topGraph}
+          bottomGraph={bottomGraph}
+          onSelectPattern={handleSelectPartial}
+        />
+      </aside>
+
+      <aside className="status-panel search-panel" style={mode !== 'complete' ? { display: 'none' } : {}}>
+        <h3>Complete From Partial</h3>
+        <CompleteFromPartial
+          gen={gen}
+          topGraph={topGraph}
+          bottomGraph={bottomGraph}
+          pattern={selectedPartial}
+          onLoadSolution={handleLoadSolution}
+        />
+      </aside>
+
+      <aside className="status-panel search-panel" style={mode !== 'audit' ? { display: 'none' } : {}}>
+        <h3>Correctness Audit</h3>
+        <AuditMode gen={gen} topGraph={topGraph} bottomGraph={bottomGraph} />
+      </aside>
+
+      <aside className="status-panel search-panel" style={mode !== 'random' ? { display: 'none' } : {}}>
+        <h3>Random Search</h3>
+        <RandomSearch
           gen={gen}
           topGraph={topGraph}
           bottomGraph={bottomGraph}

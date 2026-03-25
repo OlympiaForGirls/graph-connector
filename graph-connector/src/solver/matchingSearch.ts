@@ -1,95 +1,51 @@
-// matchingSearch.ts — incremental-validation DFS for bipartite perfect matchings.
+// matchingSearch.ts — public entry point for the bipartite matching search.
 //
-// ── GENERATION-3 COMPLEXITY NOTE ───────────────────────────────────────────────
-// Gen=3 has 12 frontier nodes per side (3×2^(gen-1)).
-// Naïve DFS: 12! permutations × 3^12 colour choices ≈ 2×10^15 states — infeasible.
-// Even with Rule A alone the space is 12! × 1.33^12 ≈ 2×10^12.
-// Three pruning layers reduce this to a tractable search.
+// This file is the ONLY module imported by matchingWorker.ts and SearchMode.tsx.
+// It owns the public types (SearchMode, SearchProgress, SearchResult) and the
+// runSearch() function.  The actual search engine lives in cpSolver.ts, behind
+// the CpSolverParams / CpSolverResult interface.
 //
-// ── PRUNING LAYERS (cheapest first) ────────────────────────────────────────────
+// ── DISPATCH STRATEGY ──────────────────────────────────────────────────────────
+// • first1  — random-restart search.  Tries up to FIRST1_RESTARTS different
+//             random orderings of the bottom frontier, each with 1/FIRST1_RESTARTS
+//             of the total time budget.  Random restarts are highly effective when
+//             solutions exist but the default ordering leads to a long dry run
+//             before the first solution is encountered.
 //
-//  Layer 1 — Rule A, O(1) per step (precomputed parent-edge colours):
-//    Every frontier node has exactly one parent tree-edge.  A cross-edge colour
-//    must differ from the parent-edge colour at BOTH endpoints.  Precomputed once
-//    before the DFS; checked before recursing.  Cuts ≈ 60% of branches at near-
-//    zero cost.
+// • first10 / all — single-pass CP solver.  The constraint propagation is the
+//             bottleneck for exhaustive enumeration; changing search order between
+//             restarts would re-explore the same solution space.
 //
-//  Layer 2 — Incremental Rules B & C, O(paths in current graph) per step:
-//    After each cross-edge is tentatively added, findNewCycleColors() does a
-//    bounded DFS from one endpoint back to the other through the existing adj.
-//    Every path found becomes a new simple cycle; the cycle is checked against:
-//      Rule B — canonical-rotation fingerprint must be unique among all cycles
-//               accepted on the current DFS path.
-//      Rule C — even-length cycle cannot be mirror-symmetric.
-//    A violation prunes the entire subtree immediately — typically after only
-//    2–4 cross-edges are placed — long before the base case is reached.
-//
-//    Correctness: every cycle in the final graph uses ≥ 2 cross-edges (trees are
-//    acyclic).  When the LAST cross-edge of a cycle (by DFS insertion order) is
-//    added, the rest of the cycle already exists in adj, so findNewCycleColors
-//    will find it (provided the path count cap is not exceeded).  Rule-B
-//    fingerprints are tracked per-path and rolled back on backtrack.
-//    A base-case call to validateCompleteMatching() acts as a safety net for
-//    any cycles the bounded search (MAX_PATHS_PER_EDGE) might miss.
-//
-//  Layer 3 — Partial-state memoisation:
-//    After exhausting a subtree with no new solutions the canonical key of the
-//    current partial matching (sorted "botId:colour" tokens) is stored in
-//    badStates.  A future DFS node that reaches the same key is pruned instantly.
-//    In fixed top-order traversal the hit rate is low, but the cost per lookup is
-//    O(1) and the saving is large when a hit does occur.
-//
-// ── WEB-WORKER READINESS ───────────────────────────────────────────────────────
-//   No React, DOM, or browser-specific APIs are used.
-//   Import directly from matchingWorker.ts without modification.
-//
-// ── STOPPING AND PROGRESS ──────────────────────────────────────────────────────
-//   shouldStop() is polled every STOP_CHECK_INTERVAL DFS steps so the search
-//   can be interrupted as soon as the user clicks Stop.
-//   onProgress() receives a SearchProgress snapshot at those same checkpoints.
+// ── REPLACING THE ENGINE ───────────────────────────────────────────────────────
+// To swap in a SAT/WASM/server-side solver, implement runCPSolver's interface
+// (CpSolverParams → CpSolverResult) in a new file and update the two dispatch
+// calls in runSinglePass / runWithRestarts below.
 
 import type { Graph, CrossEdge, EdgeColor } from '../types/graph';
-import type { SolutionSnapshot, ConnectionSnapshot } from '../types/solution';
-import { buildUnifiedAdjList, findAllCycles } from '../utils/cycleDetection';
-import { canonicalRotation, dihedralCanonical, hasMirrorSymmetry } from '../validation/cycleAnalysis';
+import type { SolutionSnapshot } from '../types/solution';
+import {
+  runCPSolver, buildBaseAdj,
+  type CpProgress, type CpSolverResult,
+} from './cpSolver';
 
-/** Generations above this value are blocked in Search Mode. */
+/** Generations above this threshold trigger a search-time warning in the UI. */
 export const MAX_SEARCH_GEN = 3;
 
-const COLORS: EdgeColor[] = ['red', 'green', 'blue'];
-
-/** Poll shouldStop / check timeout every N DFS steps. */
-const STOP_CHECK_INTERVAL = 200;
-
-/** Minimum ms between progress emissions (wall-clock gate). */
-const PROGRESS_INTERVAL_MS = 200;
-
-/**
- * Maximum simple paths searched per newly added cross-edge when looking for
- * new cycles.  Higher → more pruning power, more work per step.
- * 50 is sufficient to detect all cycles for gen ≤ 3 in practice.
- */
-const MAX_PATHS_PER_EDGE = 50;
+/** Number of restart attempts for first1 mode (each gets timeBudget/N ms). */
+const FIRST1_RESTARTS = 5;
 
 export type SearchMode = 'first1' | 'first10' | 'all';
 
 export interface SearchProgress {
-  /** (topNode, botNode, colour) triples that passed Rule A and were recursed on. */
+  /** (topNode, botNode, colour) triples tentatively explored. */
   partialStatesExplored:      number;
-  /** Times the DFS reached a complete matching (all top nodes paired). */
+  /** Times a complete matching was reached and validated. */
   completeMatchingsEvaluated: number;
-  /** Complete matchings that also passed all cycle rules. */
+  /** Complete matchings that passed all cycle rules. */
   validSolutionsFound:        number;
-  /** User clicked Stop. */
-  stopped:  boolean;
-  /** Safety-fallback timeout was hit. */
-  timedOut: boolean;
-  /** Search completed naturally (neither stopped nor timed out). */
-  done:     boolean;
-  /**
-   * True when done AND the DFS fully exhausted all possibilities without hitting
-   * the solution cap.  False when the search stopped early at the cap limit.
-   */
+  stopped:   boolean;
+  timedOut:  boolean;
+  done:      boolean;
   exhausted: boolean;
   unequalCounts?: boolean;
 }
@@ -99,100 +55,197 @@ export interface SearchResult {
   progress:  SearchProgress;
 }
 
-// ── Incremental adjacency list ───────────────────────────────────────────────
-type AdjEntry = { neighbor: string; color: EdgeColor };
-type IncrAdj  = Map<string, AdjEntry[]>;
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-function addIncrEdge(adj: IncrAdj, a: string, b: string, color: EdgeColor) {
-  if (!adj.has(a)) adj.set(a, []);
-  if (!adj.has(b)) adj.set(b, []);
-  adj.get(a)!.push({ neighbor: b, color });
-  adj.get(b)!.push({ neighbor: a, color });
+/** Seeded Fisher-Yates shuffle (deterministic per seed, O(N)). */
+function shuffled<T>(arr: T[], seed: number): T[] {
+  const out = [...arr];
+  let s = seed | 0;
+  for (let i = out.length - 1; i > 0; i--) {
+    s = (Math.imul(s, 1664525) + 1013904223) | 0;   // LCG
+    const j = ((s >>> 0) % (i + 1)) | 0;
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
 }
 
-function removeIncrEdge(adj: IncrAdj, a: string, b: string, color: EdgeColor) {
-  const strip = (arr: AdjEntry[], tgt: string) => {
-    const i = arr.findIndex(e => e.neighbor === tgt && e.color === color);
-    if (i !== -1) arr.splice(i, 1);
+function toSearchProgress(
+  r: CpSolverResult,
+  done: boolean,
+): SearchProgress {
+  return {
+    partialStatesExplored:      r.partialStatesExplored,
+    completeMatchingsEvaluated: r.completeMatchingsEvaluated,
+    validSolutionsFound:        r.solutions.length,
+    stopped:   r.stopped,
+    timedOut:  r.timedOut,
+    done,
+    exhausted: r.exhausted,
   };
-  const la = adj.get(a); if (la) strip(la, b);
-  const lb = adj.get(b); if (lb) strip(lb, a);
 }
 
-// ── New-cycle finder (Layer 2) ───────────────────────────────────────────────
-/**
- * Called BEFORE adding edge (edgeFrom, edgeTo, edgeColor) to adj.
- * Returns up to MAX_PATHS_PER_EDGE colour sequences, one per new simple cycle.
- * Each colour sequence is [edgeColor, ...colours along the path edgeTo→edgeFrom].
- *
- * Correctness: adding edge (u, v) creates exactly the cycles formed by paths
- * from v back to u in the existing graph combined with the new edge u→v.
- * The DFS here enumerates those paths.
- */
-function findNewCycleColors(
-  adj:       IncrAdj,
-  edgeFrom:  string,
-  edgeTo:    string,
-  edgeColor: EdgeColor,
-): EdgeColor[][] {
-  const results: EdgeColor[][] = [];
-  const pathColors: EdgeColor[] = [];
-  // edgeTo is the DFS start — mark visited so the search can't loop back to it.
-  const visited = new Set<string>([edgeTo]);
+/** Accumulate progress counts across multiple solver runs (for restart reporting). */
+function accumulateProgress(
+  prev: SearchProgress,
+  r: CpSolverResult,
+  done: boolean,
+): SearchProgress {
+  return {
+    partialStatesExplored:
+      prev.partialStatesExplored + r.partialStatesExplored,
+    completeMatchingsEvaluated:
+      prev.completeMatchingsEvaluated + r.completeMatchingsEvaluated,
+    validSolutionsFound: prev.validSolutionsFound + r.solutions.length,
+    stopped:   r.stopped,
+    timedOut:  r.timedOut,
+    done,
+    exhausted: r.exhausted,
+  };
+}
 
-  function dfs(current: string): void {
-    for (const { neighbor, color } of adj.get(current) ?? []) {
-      if (results.length >= MAX_PATHS_PER_EDGE) return;
+/** Compute parent-edge colour for each frontier node (forbidden on cross-edges). */
+function computeParentColors(
+  topGraph: Graph, bottomGraph: Graph,
+  topFrontier: Graph['nodes'], botFrontier: Graph['nodes'],
+): Map<string, EdgeColor> {
+  const parentColor = new Map<string, EdgeColor>();
+  const frontierIds = new Set([...topFrontier, ...botFrontier].map(n => n.id));
+  for (const e of topGraph.edges)    if (frontierIds.has(e.targetId)) parentColor.set(e.targetId, e.color);
+  for (const e of bottomGraph.edges) if (frontierIds.has(e.targetId)) parentColor.set(e.targetId, e.color);
+  return parentColor;
+}
 
-      if (neighbor === edgeFrom) {
-        // Path edgeTo → ... → current → edgeFrom found.
-        // Full cycle: edgeFrom —(new edge)→ edgeTo → ... → current → edgeFrom.
-        results.push([edgeColor, ...pathColors, color]);
-        // Don't recurse into edgeFrom — the cycle is complete here.
-        continue;
-      }
-      if (!visited.has(neighbor)) {
-        visited.add(neighbor);
-        pathColors.push(color);
-        dfs(neighbor);
-        pathColors.pop();
-        visited.delete(neighbor);
-      }
+// ── Single-pass solver (first10 / all) ───────────────────────────────────────
+function runSinglePass(
+  gen:              number,
+  topGraph:         Graph,
+  bottomGraph:      Graph,
+  topFrontier:      Graph['nodes'],
+  botFrontier:      Graph['nodes'],
+  parentColor:      Map<string, EdgeColor>,
+  maxSolutions:     number,
+  shouldStop:       () => boolean,
+  onProgress:       (p: SearchProgress) => void,
+  onSolution:       (s: SolutionSnapshot) => void,
+  safetyTimeLimitMs: number,
+  fixedCrossEdges?: CrossEdge[],
+): SearchResult {
+  const startTime = Date.now();
+  const adj       = buildBaseAdj(topGraph, bottomGraph);
+
+  const r = runCPSolver({
+    gen, topGraph, bottomGraph, topFrontier, botFrontier,
+    parentColor, adj, maxSolutions,
+    shouldStop,
+    onProgress: (p: CpProgress) => {
+      onProgress({ ...p, done: false, exhausted: false });
+    },
+    onSolution,
+    startTime, timeLimitMs: safetyTimeLimitMs,
+    fixedCrossEdges,
+  });
+
+  const done = !r.stopped && !r.timedOut;
+  const final = toSearchProgress(r, done);
+  onProgress(final);
+  return { solutions: r.solutions, progress: final };
+}
+
+// ── Random-restart solver (first1) ────────────────────────────────────────────
+//
+// Tries FIRST1_RESTARTS different random bot orderings in sequence.
+// Each restart gets timeBudget / FIRST1_RESTARTS ms.
+// Stops as soon as any restart finds a solution or the user cancels.
+//
+// Why restarts help for first1:
+//   With N=24, the search tree's "good" branches (those leading quickly to a
+//   solution) may be at unfavourable positions under the default bot ordering.
+//   A different ordering changes which branches are explored first, giving a
+//   probabilistic guarantee of finding a solution quickly if one exists at
+//   shallow depth.  Seed 0 is always the original ordering so we don't skip it.
+function runWithRestarts(
+  gen:              number,
+  topGraph:         Graph,
+  bottomGraph:      Graph,
+  topFrontier:      Graph['nodes'],
+  botFrontier:      Graph['nodes'],
+  parentColor:      Map<string, EdgeColor>,
+  shouldStop:       () => boolean,
+  onProgress:       (p: SearchProgress) => void,
+  onSolution:       (s: SolutionSnapshot) => void,
+  safetyTimeLimitMs: number,
+  fixedCrossEdges?: CrossEdge[],
+): SearchResult {
+  const perRestartMs = Math.floor(safetyTimeLimitMs / FIRST1_RESTARTS);
+
+  let accumulated: SearchProgress = {
+    partialStatesExplored: 0, completeMatchingsEvaluated: 0, validSolutionsFound: 0,
+    stopped: false, timedOut: false, done: false, exhausted: false,
+  };
+
+  for (let restart = 0; restart < FIRST1_RESTARTS; restart++) {
+    if (shouldStop()) break;
+
+    // Seed 0 → original order; seeds 1..N-1 → different random permutations.
+    const orderedBots = restart === 0 ? botFrontier : shuffled(botFrontier, restart * 0x9e3779b9);
+    const adj         = buildBaseAdj(topGraph, bottomGraph);
+    const startTime   = Date.now();
+
+    const r = runCPSolver({
+      gen, topGraph, bottomGraph,
+      topFrontier, botFrontier: orderedBots,
+      parentColor, adj,
+      maxSolutions: 1,
+      shouldStop,
+      onProgress: (p: CpProgress) => {
+        const sp: SearchProgress = {
+          partialStatesExplored:
+            accumulated.partialStatesExplored + p.partialStatesExplored,
+          completeMatchingsEvaluated:
+            accumulated.completeMatchingsEvaluated + p.completeMatchingsEvaluated,
+          validSolutionsFound:
+            accumulated.validSolutionsFound + p.validSolutionsFound,
+          stopped: p.stopped, timedOut: p.timedOut,
+          done: false, exhausted: false,
+        };
+        onProgress(sp);
+      },
+      onSolution,
+      startTime, timeLimitMs: perRestartMs,
+      fixedCrossEdges,
+    });
+
+    accumulated = accumulateProgress(accumulated, r, false);
+
+    if (r.solutions.length > 0 || r.stopped) {
+      // Found a solution (or user stopped) — done.
+      const final: SearchProgress = {
+        ...accumulated,
+        validSolutionsFound: accumulated.validSolutionsFound,
+        stopped:   r.stopped,
+        timedOut:  false,
+        done:      !r.stopped,
+        exhausted: false,
+      };
+      onProgress(final);
+      return { solutions: r.solutions, progress: final };
     }
+
+    // This restart timed out with no solution.  Accumulate counts and try next.
   }
 
-  dfs(edgeTo);
-  return results;
+  // All restarts exhausted without finding a solution.
+  const final: SearchProgress = {
+    ...accumulated,
+    timedOut:  true,
+    done:      false,
+    exhausted: false,
+  };
+  onProgress(final);
+  return { solutions: [], progress: final };
 }
 
-// ── Base-case safety-net validator ───────────────────────────────────────────
-/**
- * Full Rules B+C check on the complete matching.
- * Runs only when a complete matching is reached — rare with good incremental
- * pruning — and acts as a safety net for any cycles that the bounded
- * findNewCycleColors search might have missed.
- */
-function validateCompleteMatching(
-  topGraph:    Graph,
-  bottomGraph: Graph,
-  edges:       CrossEdge[],
-): boolean {
-  const adj    = buildUnifiedAdjList(topGraph, bottomGraph, edges);
-  const cycles = findAllCycles(adj);
-
-  const seen = new Set<string>();
-  for (const c of cycles) {
-    const fp = dihedralCanonical(c.colors);   // Rule B: rotation + reflection equiv.
-    if (seen.has(fp)) return false;
-    seen.add(fp);
-  }
-  for (const c of cycles) {
-    if (c.nodes.length % 2 === 0 && hasMirrorSymmetry(c.colors)) return false;
-  }
-  return true;
-}
-
-// ── Main entry point ─────────────────────────────────────────────────────────
+// ── Main entry point ──────────────────────────────────────────────────────────
 export function runSearch(
   gen:              number,
   topGraph:         Graph,
@@ -202,188 +255,36 @@ export function runSearch(
   onProgress:       (p: SearchProgress) => void = () => {},
   onSolution:       (s: SolutionSnapshot) => void = () => {},
   safetyTimeLimitMs = 60_000,
+  fixedCrossEdges?: CrossEdge[],
 ): SearchResult {
 
   const topFrontier = topGraph.nodes.filter(n => n.isFrontier);
   const botFrontier = bottomGraph.nodes.filter(n => n.isFrontier);
 
-  const emptyProgress = (extra: Partial<SearchProgress> = {}): SearchProgress => ({
-    partialStatesExplored: 0, completeMatchingsEvaluated: 0, validSolutionsFound: 0,
-    stopped: false, timedOut: false, done: true, exhausted: true, ...extra,
+  const empty = (extra: Partial<SearchProgress> = {}): SearchResult => ({
+    solutions: [],
+    progress: {
+      partialStatesExplored: 0, completeMatchingsEvaluated: 0, validSolutionsFound: 0,
+      stopped: false, timedOut: false, done: true, exhausted: true, ...extra,
+    },
   });
 
   if (topFrontier.length !== botFrontier.length) {
-    return { solutions: [], progress: emptyProgress({ unequalCounts: true }) };
+    return empty({ unequalCounts: true });
   }
 
+  const parentColor = computeParentColors(topGraph, bottomGraph, topFrontier, botFrontier);
   const maxSolutions = mode === 'first1' ? 1 : mode === 'first10' ? 10 : 200;
 
-  // ── Layer 1: precompute parent-edge colours ──────────────────
-  const parentColor = new Map<string, EdgeColor>();
-  {
-    const frontierIds = new Set([...topFrontier, ...botFrontier].map(n => n.id));
-    for (const e of topGraph.edges)    if (frontierIds.has(e.targetId)) parentColor.set(e.targetId, e.color);
-    for (const e of bottomGraph.edges) if (frontierIds.has(e.targetId)) parentColor.set(e.targetId, e.color);
+  if (mode === 'first1') {
+    return runWithRestarts(
+      gen, topGraph, bottomGraph, topFrontier, botFrontier,
+      parentColor, shouldStop, onProgress, onSolution, safetyTimeLimitMs, fixedCrossEdges,
+    );
   }
 
-  // ── Build initial adj from tree edges ────────────────────────
-  const adj: IncrAdj = new Map();
-  for (const n of topGraph.nodes)    adj.set(n.id, []);
-  for (const n of bottomGraph.nodes) adj.set(n.id, []);
-  for (const e of topGraph.edges)    addIncrEdge(adj, e.sourceId, e.targetId, e.color);
-  for (const e of bottomGraph.edges) addIncrEdge(adj, e.sourceId, e.targetId, e.color);
-
-  // ── Shared backtracking state ────────────────────────────────
-  const currentEdges:    CrossEdge[] = [];
-  const usedBotIds       = new Set<string>();
-  // Rule-B fingerprints accumulated along the current DFS path; rolled back
-  // on backtrack so each path sees only its own accepted cycles.
-  const seenFingerprints = new Set<string>();
-  // Layer 3: partial states known to produce no solutions.
-  const badStates        = new Set<string>();
-
-  const solutions:          SolutionSnapshot[] = [];
-  const startTime          = Date.now();
-  let partialStatesExplored      = 0;
-  let completeMatchingsEvaluated = 0;
-  let stopped  = false;
-  let timedOut = false;
-  let stepCount = 0;
-  let lastProgressEmitTime = Date.now();
-
-  function emitProgress(done = false) {
-    onProgress({
-      partialStatesExplored,
-      completeMatchingsEvaluated,
-      validSolutionsFound: solutions.length,
-      stopped, timedOut, done,
-      exhausted: done && !stopped && !timedOut && solutions.length < maxSolutions,
-    });
-  }
-
-  // Layer 3 key: sorted "botId:colour" tokens (order-independent).
-  function partialKey(): string {
-    return currentEdges.map(e => `${e.bottomNodeId}:${e.color}`).sort().join('|');
-  }
-
-  // ── DFS ──────────────────────────────────────────────────────
-  function dfs(topIdx: number): void {
-    if (stopped || timedOut || solutions.length >= maxSolutions) return;
-
-    stepCount++;
-    if (stepCount % STOP_CHECK_INTERVAL === 0) {
-      if (shouldStop()) { stopped = true; return; }
-      if (Date.now() - startTime > safetyTimeLimitMs) { timedOut = true; return; }
-      // Time-based fallback: emit progress if no partial-state milestone was hit recently.
-      const now = Date.now();
-      if (now - lastProgressEmitTime >= PROGRESS_INTERVAL_MS) {
-        emitProgress();
-        lastProgressEmitTime = now;
-      }
-    }
-
-    // Layer 3: memoisation guard.
-    const key = partialKey();
-    if (badStates.has(key)) return;
-
-    if (topIdx === topFrontier.length) {
-      // ── Base case: complete bipartite perfect matching ────────
-      // Incremental checks have already validated all reachable cycles;
-      // this call is a safety net for any the bounded path search missed.
-      completeMatchingsEvaluated++;
-      if (!validateCompleteMatching(topGraph, bottomGraph, currentEdges)) return;
-
-      const connections: ConnectionSnapshot[] = currentEdges.map(e => ({
-        from: e.topNodeId, to: e.bottomNodeId, color: e.color,
-      }));
-      const snap: SolutionSnapshot = {
-        id:          `sol-${Date.now()}-${solutions.length}`,
-        generation:  gen,
-        connections,
-        timestamp:   Date.now(),
-      };
-      solutions.push(snap);
-      onSolution(snap);   // stream to caller immediately
-      return;
-    }
-
-    const topNode        = topFrontier[topIdx];
-    const topForbidColor = parentColor.get(topNode.id);
-    const prevSolCount   = solutions.length;
-
-    for (const botNode of botFrontier) {
-      if (usedBotIds.has(botNode.id)) continue;
-      const botForbidColor = parentColor.get(botNode.id);
-
-      for (const color of COLORS) {
-        // ── Layer 1: Rule A gate, O(1) ───────────────────────
-        if (color === topForbidColor || color === botForbidColor) continue;
-
-        partialStatesExplored++;
-        // Emit progress at most once per PROGRESS_INTERVAL_MS.
-        // Checking Date.now() every state is cheap; this guarantees live updates
-        // regardless of how fast or slow each findNewCycleColors call is.
-        {
-          const nowInner = Date.now();
-          if (nowInner - lastProgressEmitTime >= PROGRESS_INTERVAL_MS) {
-            emitProgress();
-            lastProgressEmitTime = nowInner;
-          }
-        }
-
-        // ── Layer 2: incremental cycle check ─────────────────
-        const newCycleSeqs = findNewCycleColors(adj, topNode.id, botNode.id, color);
-        const newFps: string[]  = [];
-        const newFpSet          = new Set<string>();
-        let pruned              = false;
-
-        for (const seq of newCycleSeqs) {
-          const fp = dihedralCanonical(seq);  // Rule B: rotation + reflection equiv.
-          // Rule B: fingerprint must be new among all cycles on this path.
-          if (seenFingerprints.has(fp) || newFpSet.has(fp)) { pruned = true; break; }
-          // Rule C: even-length mirror-symmetric cycle is forbidden.
-          if (seq.length % 2 === 0 && hasMirrorSymmetry(seq)) { pruned = true; break; }
-          newFps.push(fp);
-          newFpSet.add(fp);
-        }
-        if (pruned) continue;
-
-        // ── Commit ────────────────────────────────────────────
-        addIncrEdge(adj, topNode.id, botNode.id, color);
-        currentEdges.push({ id: `s${topIdx}`, topNodeId: topNode.id, bottomNodeId: botNode.id, color });
-        usedBotIds.add(botNode.id);
-        for (const fp of newFps) seenFingerprints.add(fp);
-
-        dfs(topIdx + 1);
-
-        // ── Backtrack (reverse order) ─────────────────────────
-        for (const fp of newFps) seenFingerprints.delete(fp);
-        usedBotIds.delete(botNode.id);
-        currentEdges.pop();
-        removeIncrEdge(adj, topNode.id, botNode.id, color);
-      }
-    }
-
-    // Layer 3: if this subtree yielded nothing new, mark it as bad.
-    if (solutions.length === prevSolCount && !stopped && !timedOut) {
-      badStates.add(key);
-    }
-  }
-
-  emitProgress();   // confirm worker started; shows 0/0/0 immediately
-  dfs(0);
-  emitProgress(true);
-
-  return {
-    solutions,
-    progress: {
-      partialStatesExplored,
-      completeMatchingsEvaluated,
-      validSolutionsFound: solutions.length,
-      stopped,
-      timedOut,
-      done:      !stopped && !timedOut,
-      exhausted: !stopped && !timedOut && solutions.length < maxSolutions,
-    },
-  };
+  return runSinglePass(
+    gen, topGraph, bottomGraph, topFrontier, botFrontier,
+    parentColor, maxSolutions, shouldStop, onProgress, onSolution, safetyTimeLimitMs, fixedCrossEdges,
+  );
 }

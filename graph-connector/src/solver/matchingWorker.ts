@@ -34,16 +34,28 @@ ctx.onmessage = (e: MessageEvent) => {
 
   const { gen, topGraph, bottomGraph, mode } = payload;
 
-  const result: SearchResult = runSearch(
-    gen,
-    topGraph,
-    bottomGraph,
-    mode,
-    () => false,   // stopping is done via worker.terminate(), not a flag
-    (progress: SearchProgress) => ctx.postMessage({ type: 'PROGRESS', progress }),
-    (solution: SolutionSnapshot) => ctx.postMessage({ type: 'SOLUTION', solution }),
-    60_000,
-  );
+  const topFrontierCount = topGraph.nodes.filter((n: { isFrontier: boolean }) => n.isFrontier).length;
+  const botFrontierCount = bottomGraph.nodes.filter((n: { isFrontier: boolean }) => n.isFrontier).length;
+  console.log(`[worker] gen=${gen} topFrontier=${topFrontierCount} botFrontier=${botFrontierCount} mode=${mode}`);
 
-  ctx.postMessage({ type: 'DONE', result });
+  // Send an immediate acknowledgement so the main thread can verify the worker
+  // received the START message (distinct from the first PROGRESS emission).
+  ctx.postMessage({ type: 'ACK', gen, topFrontierCount, botFrontierCount });
+
+  try {
+    const result: SearchResult = runSearch(
+      gen,
+      topGraph,
+      bottomGraph,
+      mode,
+      () => false,   // stopping is done via worker.terminate(), not a flag
+      (progress: SearchProgress) => ctx.postMessage({ type: 'PROGRESS', progress }),
+      (solution: SolutionSnapshot) => ctx.postMessage({ type: 'SOLUTION', solution }),
+      60_000,
+    );
+
+    ctx.postMessage({ type: 'DONE', result });
+  } catch (err) {
+    ctx.postMessage({ type: 'ERROR', message: String(err) });
+  }
 };
