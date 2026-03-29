@@ -32,10 +32,10 @@ const ctx = self as any;
 // ── Constants ────────────────────────────────────────────────────────────────
 const COLORS: EdgeColor[]  = ['red', 'green', 'blue'];
 const COLOR_CHAR           = 'rgb'; // int 0/1/2 → char for fp strings
-const BATCH_MS             = 10;    // ms per time-slice before yielding
-const INNER_N              = 50;    // inner iters between perf.now() checks
+const BATCH_MS             = 100;   // ms per time-slice before yielding (longer = fewer setTimeout round-trips)
+const INNER_N              = 200;   // inner iters between perf.now() checks (fewer clock calls)
 const CHECK_CAP            = 10_000;// max cycles per edge (matches validateGraph.ts)
-const PROGRESS_MS          = 250;   // min ms between PROGRESS postMessages
+const PROGRESS_MS          = 60_000;// 1 minute between PROGRESS postMessages
 
 const MAX_NODES = 512;
 const MAX_DEG   = 8;   // max adj degree per node (tree-leaf: 1 tree + 1 cross edge)
@@ -228,17 +228,24 @@ function tryOne(): boolean {
   shuffle();
 
   // Phase 1 — random assignment with Rule A
+  // Valid colors = {0,1,2} minus parent-edge colors of top and bot.
+  // Since each node blocks at most 1 color, the valid mask always has ≥1 bit set.
   for (let i = 0; i < N; i++) {
     const topIdx = topFrontierIdx[i];
     const botIdx = botFrontierIdx[perm[i]];
-    const ft = parentColorI[topIdx]; // 255=none, 0/1/2=color
+    const ft = parentColorI[topIdx]; // 255=none, 0/1/2
     const fb = parentColorI[botIdx];
-    let c = randInt(3);
-    let ok = false;
-    for (let t = 0; t < 3; t++, c = (c + 1) % 3) {
-      if ((ft === 255 || c !== ft) && (fb === 255 || c !== fb)) { ok = true; break; }
+    // Build a 3-bit valid mask, then pick uniformly from the set bits.
+    let mask = 0b111;
+    if (ft !== 255) mask &= ~(1 << ft);
+    if (fb !== 255) mask &= ~(1 << fb);
+    // Count valid colors (always 1, 2, or 3).
+    const cnt = (mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1);
+    let pick = randInt(cnt);
+    let c = 0;
+    for (let v = 0; v < 3; v++) {
+      if (mask & (1 << v)) { if (pick === 0) { c = v; break; } pick--; }
     }
-    if (!ok) return false; // no valid color exists (e.g. top and bot share 2 blocked colors)
     pairsTop[i] = topIdx;
     pairsBot[i] = botIdx;
     pairsCol[i] = c;

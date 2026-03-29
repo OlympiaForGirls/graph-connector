@@ -13,9 +13,17 @@ import { buildBaseAdj } from './cpSolver';
 import { dihedralCanonical, hasMirrorSymmetry } from '../validation/cycleAnalysis';
 
 const COLORS: EdgeColor[] = ['red', 'green', 'blue'];
-const CYCLE_PATH_CAP = 200;
-const STOP_CHECK_INTERVAL = 200;
-const PROGRESS_INTERVAL_MS = 200;
+// Two-tier cap (mirrors cpSolver.ts and completeWorker.ts):
+//   FAST_CAP  — cheap pre-filter; exits on first violation found; may miss long-cycle violations.
+//   CHECK_CAP — full commit-time cap; must match validateGraph.ts (10,000) so that
+//               long cycles (e.g. 24-edge mirror-symmetric cycles in gen-4 with many
+//               committed edges) are never missed. Cap=200 is provably insufficient
+//               for gen-4 at high depth.
+const FAST_CAP  = 50;
+const CHECK_CAP = 10_000;
+// With CHECK_CAP=10,000 each DFS step is heavy, so check the clock every call.
+const STOP_CHECK_INTERVAL  = 1;
+const PROGRESS_INTERVAL_MS = 3_000; // emit progress every 3 seconds
 
 type AdjEntry = { neighbor: string; color: EdgeColor };
 type IncrAdj  = Map<string, AdjEntry[]>;
@@ -71,12 +79,34 @@ function findNewCycleColors(
   return results;
 }
 
-/** Check and collect new fingerprints for an edge. Returns null if any rule is violated. */
-function checkEdge(
+/**
+ * Fast pre-filter: checks with FAST_CAP only.
+ * Returns false if a violation is found quickly; true if no violation found at low cap.
+ * A true result does NOT guarantee validity — use checkEdgeFull before committing.
+ */
+function isFeasible(
+  adj: IncrAdj, topId: string, botId: string,
+  color: EdgeColor, seenFps: Set<string>,
+): boolean {
+  const seqs = findNewCycleColors(adj, topId, botId, color, FAST_CAP);
+  for (const seq of seqs) {
+    const fp = dihedralCanonical(seq);
+    if (seenFps.has(fp)) return false;
+    if (seq.length % 2 === 0 && hasMirrorSymmetry(seq)) return false;
+  }
+  return true;
+}
+
+/**
+ * Full commit-time check: uses CHECK_CAP=10,000 to catch long-cycle violations
+ * that FAST_CAP misses (critical for gen-4 at high depth).
+ * Returns new fingerprints to register on commit, or null on any violation.
+ */
+function checkEdgeFull(
   adj: IncrAdj, topId: string, botId: string,
   color: EdgeColor, seenFps: Set<string>,
 ): string[] | null {
-  const seqs = findNewCycleColors(adj, topId, botId, color, CYCLE_PATH_CAP);
+  const seqs = findNewCycleColors(adj, topId, botId, color, CHECK_CAP);
   const newFps: string[] = [];
   for (const seq of seqs) {
     const fp = dihedralCanonical(seq);
@@ -187,7 +217,12 @@ export function runPartialSearch(
           const color = COLORS[ci];
           if (color === forbidTop || color === forbidBot) continue;
 
-          const fps = checkEdge(adj, topId, botId, color, seenFps);
+          // Fast pre-filter: skip obviously infeasible options cheaply.
+          if (!isFeasible(adj, topId, botId, color, seenFps)) continue;
+
+          // Full commit-time check with CHECK_CAP=10,000 — catches long-cycle
+          // violations (mirror-symmetric 24-edge cycles, etc.) that FAST_CAP misses.
+          const fps = checkEdgeFull(adj, topId, botId, color, seenFps);
           if (fps === null) continue;
 
           statesExplored++;

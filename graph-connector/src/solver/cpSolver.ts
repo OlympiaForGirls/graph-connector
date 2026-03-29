@@ -55,7 +55,7 @@
 //
 // Adaptive path cap:
 //   At depth d (d cross-edges already committed), the cycle-search cap for
-//   buildFeasibleEntry is max(FAST_CAP, MAX_PATHS - d×5).  At depth 0 we use
+//   buildFeasibl            eEntry is max(FAST_CAP, MAX_PATHS - d×5).  At depth 0 we use
 //   200 paths; at depth 30 the cap floors at 50.  Deep levels already have many
 //   fingerprints in seenFingerprints so violations are found early anyway.
 //
