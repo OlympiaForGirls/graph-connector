@@ -299,11 +299,9 @@ let gen         = 0;
 let startTime   = 0;
 
 // Metrics
-let lastProgressTime    = 0;
-let uiUpdates           = 0;
-let batchCount          = 0;
-let attemptsAtLastBatch = 0;
-let lastBatchTime       = 0;
+let lastProgressTime = 0;
+let uiUpdates        = 0;
+let batchCount       = 0;
 
 // ── Batch runner ──────────────────────────────────────────────────────────────
 function runBatch(): void {
@@ -364,8 +362,6 @@ function runBatch(): void {
       uiUpdates,
       avgBatchSize:            Math.round(attempts / batchCount),
     });
-    attemptsAtLastBatch = attempts;
-    lastBatchTime       = now;
   }
 
   setTimeout(runBatch, 0); // yield to event loop (allows STOP to be processed)
@@ -392,11 +388,9 @@ ctx.onmessage = (e: MessageEvent) => {
   validFound = 0;
   seenKeys   = new Set();
   startTime  = performance.now();
-  lastProgressTime    = 0;
-  uiUpdates           = 0;
-  batchCount          = 0;
-  attemptsAtLastBatch = 0;
-  lastBatchTime       = 0;
+  lastProgressTime = 0;
+  uiUpdates        = 0;
+  batchCount       = 0;
   seed = (Date.now() ^ (Math.random() * 0x80000000 | 0)) | 0;
 
   // Build integer node index mapping.
