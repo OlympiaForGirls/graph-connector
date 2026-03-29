@@ -10,16 +10,20 @@ import { appendSolutions } from '../storage/solutions';
 import { EDGE_COLORS } from './GraphView';
 
 interface Props {
-  gen:          number;
-  topGraph:     Graph;
-  bottomGraph:  Graph;
+  gen:            number;
+  topGraph:       Graph;
+  bottomGraph:    Graph;
   onLoadSolution: (connections: ConnectionSnapshot[]) => void;
 }
 
 interface RandomStats {
-  attempts:       number;
-  validFound:     number;
-  attemptsPerSec: number;
+  attempts:              number;
+  validFound:            number;
+  attemptsPerSecCurrent: number;
+  attemptsPerSecAvg:     number;
+  uptime:                number;  // seconds
+  uiUpdates:             number;
+  avgBatchSize:          number;
 }
 
 function formatCount(n: number): string {
@@ -33,6 +37,12 @@ function formatRate(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M/s`;
   if (n >= 1_000)     return `${(n / 1_000).toFixed(0)}k/s`;
   return `${n}/s`;
+}
+
+function formatUptime(sec: number): string {
+  if (sec < 60)  return `${sec.toFixed(1)}s`;
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return `${m}m ${s}s`;
 }
 
 export default function RandomSearch({
@@ -62,7 +72,8 @@ export default function RandomSearch({
     workerRef.current?.terminate();
 
     setSolutions([]);
-    setStats({ attempts: 0, validFound: 0, attemptsPerSec: 0 });
+    setStats({ attempts: 0, validFound: 0, attemptsPerSecCurrent: 0,
+               attemptsPerSecAvg: 0, uptime: 0, uiUpdates: 0, avgBatchSize: 0 });
     setRunning(true);
     setStopped(false);
 
@@ -81,9 +92,13 @@ export default function RandomSearch({
         setSolutions(prev => [...prev, sol]);
       } else if (msg.type === 'PROGRESS') {
         setStats({
-          attempts:       msg.attempts       as number,
-          validFound:     msg.validFound     as number,
-          attemptsPerSec: msg.attemptsPerSec as number,
+          attempts:              msg.attempts              as number,
+          validFound:            msg.validFound            as number,
+          attemptsPerSecCurrent: msg.attemptsPerSecCurrent as number,
+          attemptsPerSecAvg:     msg.attemptsPerSecAvg     as number,
+          uptime:                msg.uptime                as number,
+          uiUpdates:             msg.uiUpdates             as number,
+          avgBatchSize:          msg.avgBatchSize          as number,
         });
       } else if (msg.type === 'STOPPED') {
         setStats(prev => prev ? {
@@ -102,16 +117,11 @@ export default function RandomSearch({
       workerRef.current = null;
     };
 
-    worker.postMessage({
-      type: 'START',
-      payload: { gen, topGraph, bottomGraph },
-    });
+    worker.postMessage({ type: 'START', payload: { gen, topGraph, bottomGraph } });
   }, [gen, topGraph, bottomGraph]);
 
   const handleStop = useCallback(() => {
-    if (!workerRef.current) return;
-    workerRef.current.postMessage({ type: 'STOP' });
-    // Worker will reply with STOPPED; running will be cleared then.
+    workerRef.current?.postMessage({ type: 'STOP' });
   }, []);
 
   const handleClear = useCallback(() => {
@@ -146,34 +156,64 @@ export default function RandomSearch({
       </div>
 
       {stats && (
-        <div className="random-stats">
-          <div className="random-stat">
-            <span className="random-stat-label">Attempts</span>
-            <span className="random-stat-value">{formatCount(stats.attempts)}</span>
-          </div>
-          <div className="random-stat">
-            <span className="random-stat-label">Valid found</span>
-            <span className="random-stat-value random-stat-value--found">{stats.validFound}</span>
-          </div>
-          <div className="random-stat">
-            <span className="random-stat-label">Rate</span>
-            <span className="random-stat-value">{formatRate(stats.attemptsPerSec)}</span>
-          </div>
-          {hitRate !== null && (
+        <>
+          {/* Primary stats */}
+          <div className="random-stats">
             <div className="random-stat">
-              <span className="random-stat-label">Hit rate</span>
-              <span className="random-stat-value">{hitRate}%</span>
+              <span className="random-stat-label">Attempts</span>
+              <span className="random-stat-value">{formatCount(stats.attempts)}</span>
             </div>
-          )}
-        </div>
+            <div className="random-stat">
+              <span className="random-stat-label">Valid found</span>
+              <span className="random-stat-value random-stat-value--found">{stats.validFound}</span>
+            </div>
+            <div className="random-stat">
+              <span className="random-stat-label">Rate (cur)</span>
+              <span className="random-stat-value">{formatRate(stats.attemptsPerSecCurrent)}</span>
+            </div>
+            <div className="random-stat">
+              <span className="random-stat-label">Rate (avg)</span>
+              <span className="random-stat-value">{formatRate(stats.attemptsPerSecAvg)}</span>
+            </div>
+            {hitRate !== null && (
+              <div className="random-stat">
+                <span className="random-stat-label">Hit rate</span>
+                <span className="random-stat-value">{hitRate}%</span>
+              </div>
+            )}
+          </div>
+
+          {/* Diagnostics */}
+          <div className="random-diag">
+            <span className="random-diag-title">Diagnostics</span>
+            <div className="random-stats random-stats--diag">
+              <div className="random-stat random-stat--sm">
+                <span className="random-stat-label">Uptime</span>
+                <span className="random-stat-value random-stat-value--dim">{formatUptime(stats.uptime)}</span>
+              </div>
+              <div className="random-stat random-stat--sm">
+                <span className="random-stat-label">UI updates</span>
+                <span className="random-stat-value random-stat-value--dim">{stats.uiUpdates}</span>
+              </div>
+              <div className="random-stat random-stat--sm">
+                <span className="random-stat-label">Avg batch</span>
+                <span className="random-stat-value random-stat-value--dim">{formatCount(stats.avgBatchSize)}</span>
+              </div>
+            </div>
+          </div>
+        </>
       )}
 
       {stopped && !running && (
-        <p className="random-stopped">Stopped — {solutions.length} solution{solutions.length !== 1 ? 's' : ''} collected.</p>
+        <p className="random-stopped">
+          Stopped — {solutions.length} solution{solutions.length !== 1 ? 's' : ''} collected.
+        </p>
       )}
 
       {!stats && !running && (
-        <p className="random-starting">Press <em>Start Random Search</em> to begin sampling random configurations.</p>
+        <p className="random-starting">
+          Press <em>Start Random Search</em> to begin sampling random configurations.
+        </p>
       )}
 
       {solutions.length > 0 && (

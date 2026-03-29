@@ -1,101 +1,218 @@
-// randomWorker.ts — Monte Carlo random graph search.
+// randomWorker.ts — Optimized Monte Carlo random graph search.
 //
-// Runs a time-sliced batch loop: generate random perfect matchings with random
-// colors, validate each one incrementally, emit valid solutions.
+// Hot-path allocations eliminated vs original:
+//   • Integer node indices: no string-keyed Map in hot path.
+//   • Flat Uint16/Uint8Array adj: no Map<string,…> or AdjEntry objects per node.
+//   • DFS vis as Uint8Array with mark/unmark: no `new Set()` per edge.
+//   • Cycle built into pre-allocated cycleBuf/revBuf: no EdgeColor[][] ever created.
+//   • checkCycle() inline: Rule B+C without any slice/spread/reverse allocation.
+//     Fingerprint string built once per cycle (unavoidable), zero intermediate arrays.
+//   • parentColorI as Uint8Array: no Map<string,EdgeColor> lookup in hot path.
+//   • pairsTop/Bot/Col as typed arrays: no Pair[] object allocation.
+//   • Progress throttled to 250ms: ~4× fewer React re-renders vs 10ms.
 //
-// ── Performance design ────────────────────────────────────────────────────────
-// • Pre-built tree adj (once per START): no Map rebuild on every attempt.
-// • Adj add/remove (not clone-per-attempt): O(degree)=O(3) per op vs O(N) clone.
-// • Pre-allocated pair/fp arrays: zero allocation in the hot path.
-// • Time-based 10ms batches + setTimeout yield: STOP responds within ~10ms.
-// • LCG RNG: faster than Math.random() for tight inner loops.
-// • Rule A fast-prune in Phase 1: rejects impossible (top,bot) pairs before
-//   touching the adj or running any cycle DFS.
-// • CHECK_CAP=10,000: matches validateGraph.ts safety-net, catches long cycles
-//   (cap 200 is insufficient for gen-4 graphs with many committed cross-edges).
+// Correctness identical to original: CHECK_CAP=10_000, Rule A+B+C.
 //
-// ── Message protocol ──────────────────────────────────────────────────────────
-// main → worker: { type:'START', payload:{ gen, topGraph, bottomGraph } }
-//                { type:'STOP' }
-// worker → main: { type:'ACK' }
-//                { type:'SOLUTION', solution: SolutionSnapshot }
-//                { type:'PROGRESS', attempts, validFound, attemptsPerSec }
-//                { type:'STOPPED', attempts, validFound }
+// Message protocol:
+//   main → worker:  { type:'START', payload:{ gen, topGraph, bottomGraph } }
+//                   { type:'STOP' }
+//   worker → main:  { type:'ACK' }
+//                   { type:'SOLUTION', solution: SolutionSnapshot }
+//                   { type:'PROGRESS', attempts, validFound,
+//                       attemptsPerSecCurrent, attemptsPerSecAvg,
+//                       uptime, uiUpdates, avgBatchSize }
+//                   { type:'STOPPED', attempts, validFound }
 
 import type { Graph, EdgeColor } from '../types/graph';
 import type { SolutionSnapshot, ConnectionSnapshot } from '../types/solution';
-import { dihedralCanonical, hasMirrorSymmetry } from '../validation/cycleAnalysis';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const ctx = self as any;
 
-const COLORS: EdgeColor[] = ['red', 'green', 'blue'];
-const BATCH_MS  = 10;     // run this many ms before yielding to the event loop
-const INNER_N   = 50;     // inner iterations between performance.now() checks
-const CHECK_CAP = 10_000; // max paths per edge in cycle DFS
+// ── Constants ────────────────────────────────────────────────────────────────
+const COLORS: EdgeColor[]  = ['red', 'green', 'blue'];
+const COLOR_CHAR           = 'rgb'; // int 0/1/2 → char for fp strings
+const BATCH_MS             = 10;    // ms per time-slice before yielding
+const INNER_N              = 50;    // inner iters between perf.now() checks
+const CHECK_CAP            = 10_000;// max cycles per edge (matches validateGraph.ts)
+const PROGRESS_MS          = 250;   // min ms between PROGRESS postMessages
 
-// ── Adjacency list ───────────────────────────────────────────────────────────
-// Pre-loaded with tree edges at START. Cross-edges are added/removed per attempt.
-type AdjEntry = { neighbor: string; color: EdgeColor };
-type Adj = Map<string, AdjEntry[]>;
-let adj: Adj = new Map();
+const MAX_NODES = 512;
+const MAX_DEG   = 8;   // max adj degree per node (tree-leaf: 1 tree + 1 cross edge)
+const MAX_DEPTH = 256; // max DFS path depth
 
-function adjAdd(a: string, b: string, c: EdgeColor) {
-  adj.get(a)!.push({ neighbor: b, color: c });
-  adj.get(b)!.push({ neighbor: a, color: c });
+// ── Flat integer adjacency ───────────────────────────────────────────────────
+// adjNb[n*MAX_DEG + i] = integer index of i-th neighbor of node n
+// adjCo[n*MAX_DEG + i] = color (0/1/2) of that edge
+// adjDeg[n]            = current degree of node n
+const adjNb  = new Uint16Array(MAX_NODES * MAX_DEG);
+const adjCo  = new Uint8Array (MAX_NODES * MAX_DEG);
+const adjDeg = new Uint16Array(MAX_NODES);
+
+function adjAddI(a: number, b: number, c: number): void {
+  const ia = adjDeg[a]++, ib = adjDeg[b]++;
+  adjNb[a * MAX_DEG + ia] = b;  adjCo[a * MAX_DEG + ia] = c;
+  adjNb[b * MAX_DEG + ib] = a;  adjCo[b * MAX_DEG + ib] = c;
 }
-function adjRemove(a: string, b: string, c: EdgeColor) {
-  const strip = (list: AdjEntry[], nb: string) => {
-    const i = list.findIndex(e => e.neighbor === nb && e.color === c);
-    if (i !== -1) list.splice(i, 1);
-  };
-  strip(adj.get(a)!, b);
-  strip(adj.get(b)!, a);
-}
 
-// ── Incremental cycle finder ──────────────────────────────────────────────────
-// Finds all simple paths from `to` back to `from` using the current adj
-// (before the candidate edge is added). Prepends edgeColor to form cycle seqs.
-function newCycles(from: string, to: string, edgeColor: EdgeColor): EdgeColor[][] {
-  const out: EdgeColor[][] = [];
-  const cols: EdgeColor[]  = [];
-  const vis = new Set<string>([to]);
-  function dfs(cur: string) {
-    for (const { neighbor, color } of adj.get(cur) ?? []) {
-      if (out.length >= CHECK_CAP) return;
-      if (neighbor === from) { out.push([edgeColor, ...cols, color]); continue; }
-      if (!vis.has(neighbor)) {
-        vis.add(neighbor); cols.push(color);
-        dfs(neighbor);
-        cols.pop(); vis.delete(neighbor);
-      }
+function adjRemoveI(a: number, b: number, c: number): void {
+  // Swap-with-last removal (no gap left in array).
+  const baseA = a * MAX_DEG, dA = --adjDeg[a];
+  for (let i = 0; i <= dA; i++) {
+    if (adjNb[baseA + i] === b && adjCo[baseA + i] === c) {
+      adjNb[baseA + i] = adjNb[baseA + dA];
+      adjCo[baseA + i] = adjCo[baseA + dA];
+      break;
     }
   }
-  dfs(to);
-  return out;
+  const baseB = b * MAX_DEG, dB = --adjDeg[b];
+  for (let i = 0; i <= dB; i++) {
+    if (adjNb[baseB + i] === a && adjCo[baseB + i] === c) {
+      adjNb[baseB + i] = adjNb[baseB + dB];
+      adjCo[baseB + i] = adjCo[baseB + dB];
+      break;
+    }
+  }
 }
 
-// ── LCG random integer in [0, n) ─────────────────────────────────────────────
+// ── DFS scratch (pre-allocated, reused every edge) ───────────────────────────
+// No allocations in the DFS hot path. dfsVis mark/unmark is done via backtracking,
+// so it remains consistent even on early exit (dfsBad=true unwinds cleanly).
+const dfsVis   = new Uint8Array(MAX_NODES); // 1 = on current path, 0 = not
+const colStack = new Uint8Array(MAX_DEPTH); // color at each DFS depth
+const cycleBuf = new Uint8Array(MAX_DEPTH); // assembled cycle colors
+const revBuf   = new Uint8Array(MAX_DEPTH); // reversed cycle (for canonical/mirror)
+
+let dfsFrom      = 0;
+let dfsEdgeColor = 0;  // color int of the candidate edge (prepended to cycle)
+let dfsCycCount  = 0;  // cycles found so far this edge (capped at CHECK_CAP)
+let dfsBad       = false;
+let dfsDepth     = 0;
+let curFpBuf: string[]; // points to fpsBuf[i] for the current edge
+
+// ── minRotation: index of lexicographically smallest rotation (O(L²), no alloc) ──
+function minRotation(arr: Uint8Array, len: number): number {
+  let best = 0;
+  outer:
+  for (let r = 1; r < len; r++) {
+    for (let k = 0; k < len; k++) {
+      const a = arr[(r    + k) % len];
+      const b = arr[(best + k) % len];
+      if (a < b) { best = r; continue outer; }
+      if (a > b) continue outer;
+    }
+  }
+  return best;
+}
+
+// ── checkCycle: inline Rule B + C, no intermediate arrays ───────────────────
+// cycleBuf[0..clen-1] must be filled before calling.
+// Returns: non-empty fingerprint string = cycle is valid and new.
+//          '' (empty string) = Rule B or C violation → dfsBad should be set.
+function checkCycle(clen: number): string {
+  // Build reversed cycle in revBuf.
+  for (let i = 0; i < clen; i++) revBuf[i] = cycleBuf[clen - 1 - i];
+
+  // Dihedral canonical = min rotation of (cycleBuf, revBuf).
+  const fwdOff = minRotation(cycleBuf, clen);
+  const revOff = minRotation(revBuf,   clen);
+
+  // Determine which (fwd@fwdOff or rev@revOff) is lexicographically smaller.
+  let useRev = false;
+  for (let k = 0; k < clen; k++) {
+    const a = revBuf[(revOff + k) % clen];
+    const b = cycleBuf[(fwdOff + k) % clen];
+    if (a < b) { useRev = true;  break; }
+    if (a > b) { useRev = false; break; }
+  }
+  const src = useRev ? revBuf  : cycleBuf;
+  const off = useRev ? revOff  : fwdOff;
+
+  // Build fingerprint string: one char per color, no intermediate arrays.
+  let fp = '';
+  for (let i = 0; i < clen; i++) fp += COLOR_CHAR[src[(off + i) % clen]];
+
+  // Rule B: dihedral duplicate?
+  if (fpSet.has(fp)) return '';
+
+  // Rule C: even-length + mirror-symmetric?
+  // Mirror symmetry: canonicalRotation(fwd) === canonicalRotation(rev).
+  // fwdOff IS minRotation(cycleBuf) and revOff IS minRotation(revBuf), so
+  // we just compare them directly.
+  if (clen % 2 === 0) {
+    let mirror = true;
+    for (let k = 0; k < clen; k++) {
+      if (cycleBuf[(fwdOff + k) % clen] !== revBuf[(revOff + k) % clen]) {
+        mirror = false;
+        break;
+      }
+    }
+    if (mirror) return '';
+  }
+
+  return fp;
+}
+
+// ── DFS: finds all simple paths from `to` back to `from` ────────────────────
+// For each path found, builds the cycle inline and calls checkCycle.
+// Sets dfsBad=true and returns immediately on violation.
+// Backtracking correctly restores dfsVis even on early exit.
+function dfs(cur: number): void {
+  if (dfsBad || dfsCycCount >= CHECK_CAP) return;
+  const base = cur * MAX_DEG;
+  const deg  = adjDeg[cur];
+  for (let i = 0; i < deg; i++) {
+    if (dfsBad || dfsCycCount >= CHECK_CAP) return;
+    const nb  = adjNb[base + i];
+    const col = adjCo[base + i];
+
+    if (nb === dfsFrom) {
+      // Cycle: [dfsEdgeColor, colStack[0..dfsDepth-1], col]
+      dfsCycCount++;
+      const clen = dfsDepth + 2;
+      cycleBuf[0] = dfsEdgeColor;
+      for (let j = 0; j < dfsDepth; j++) cycleBuf[j + 1] = colStack[j];
+      cycleBuf[dfsDepth + 1] = col;
+      const fp = checkCycle(clen);
+      if (fp === '') { dfsBad = true; return; }
+      curFpBuf.push(fp);
+      continue;
+    }
+
+    if (!dfsVis[nb]) {
+      dfsVis[nb] = 1;
+      colStack[dfsDepth++] = col;
+      dfs(nb);
+      dfsDepth--;
+      dfsVis[nb] = 0; // always executed on backtrack (even after dfsBad unwind)
+      if (dfsBad) return;
+    }
+  }
+}
+
+// ── LCG RNG (faster than Math.random() for tight loops) ──────────────────────
 let seed = 0;
 function randInt(n: number): number {
   seed = (Math.imul(seed, 1664525) + 1013904223) | 0;
   return ((seed >>> 0) / 0x100000000 * n) | 0;
 }
 
-// ── Per-attempt state (pre-allocated, reused every attempt) ──────────────────
-type Pair = { top: string; bot: string; color: EdgeColor };
-let N       = 0;
-let pairs:  Pair[];      // one slot per frontier pair, mutated each attempt
-let perm:   number[];    // bot-node permutation (Fisher-Yates shuffled in-place)
-let fpsBuf: string[][];  // fingerprints committed per edge (pre-allocated, cleared each use)
-let fpSet:  Set<string>; // active fingerprints for current attempt
+// ── Per-attempt state (typed arrays, zero allocation in hot path) ─────────────
+let N            = 0;
+let pairsTop:    Uint16Array;  // top node index for each pair
+let pairsBot:    Uint16Array;  // bot node index for each pair
+let pairsCol:    Uint8Array;   // color (0/1/2) for each pair
+let perm:        Uint16Array;  // bot permutation (shuffled in-place)
+let fpsBuf:      string[][];   // fps per edge (pre-allocated inner arrays)
+let fpSet:       Set<string>;  // active fps for current attempt
 
-let topFrontier: Array<{ id: string }>;
-let botFrontier: Array<{ id: string }>;
-let parentColor: Map<string, EdgeColor>;
+let topFrontierIdx: Uint16Array; // integer indices of top frontier nodes
+let botFrontierIdx: Uint16Array; // integer indices of bot frontier nodes
+let parentColorI:   Uint8Array;  // 255=no constraint, 0/1/2=red/green/blue
+let nodeIdxToId:    string[];    // integer index → node ID string
 
-// In-place Fisher-Yates shuffle of perm[]
-function shuffle() {
+// In-place Fisher-Yates shuffle of perm[0..N-1].
+function shuffle(): void {
   for (let i = N - 1; i > 0; i--) {
     const j = randInt(i + 1);
     const t = perm[i]; perm[i] = perm[j]; perm[j] = t;
@@ -103,121 +220,153 @@ function shuffle() {
 }
 
 // ── One random attempt ────────────────────────────────────────────────────────
-// Phase 1: assign random matching + colors (Rule A pre-prune only).
-// Phase 2: incremental cycle validation.
-// Returns true if valid (adj now has all N cross-edges added).
-// Returns false if invalid (adj restored to tree-only state).
+// Phase 1: assign random bipartite matching + colors (Rule A pre-prune only).
+// Phase 2: incremental cycle validation (Rule B + C).
+// Returns true = valid (adj now has all N cross-edges added).
+// Returns false = invalid (adj restored to tree-only state).
 function tryOne(): boolean {
   shuffle();
 
-  // Phase 1 — random assignment
+  // Phase 1 — random assignment with Rule A
   for (let i = 0; i < N; i++) {
-    const topId = topFrontier[i].id;
-    const botId = botFrontier[perm[i]].id;
-    const ft    = parentColor.get(topId);
-    const fb    = parentColor.get(botId);
-    // Random start, step through if blocked by Rule A (parent-edge color conflict)
+    const topIdx = topFrontierIdx[i];
+    const botIdx = botFrontierIdx[perm[i]];
+    const ft = parentColorI[topIdx]; // 255=none, 0/1/2=color
+    const fb = parentColorI[botIdx];
     let c = randInt(3);
     let ok = false;
     for (let t = 0; t < 3; t++, c = (c + 1) % 3) {
-      if (COLORS[c] !== ft && COLORS[c] !== fb) { ok = true; break; }
+      if ((ft === 255 || c !== ft) && (fb === 255 || c !== fb)) { ok = true; break; }
     }
-    if (!ok) return false; // no valid color — skip (no adj mutation needed)
-    pairs[i].top   = topId;
-    pairs[i].bot   = botId;
-    pairs[i].color = COLORS[c];
+    if (!ok) return false; // no valid color exists (e.g. top and bot share 2 blocked colors)
+    pairsTop[i] = topIdx;
+    pairsBot[i] = botIdx;
+    pairsCol[i] = c;
   }
 
-  // Phase 2 — incremental cycle validation
+  // Phase 2 — incremental validation
   fpSet.clear();
   for (let i = 0; i < N; i++) {
-    const { top, bot, color } = pairs[i];
-    const seqs = newCycles(top, bot, color);
+    const top = pairsTop[i], bot = pairsBot[i], col = pairsCol[i];
 
-    fpsBuf[i].length = 0;
-    let bad = false;
-    for (const seq of seqs) {
-      const fp = dihedralCanonical(seq);
-      if (fpSet.has(fp)) { bad = true; break; }
-      if (seq.length % 2 === 0 && hasMirrorSymmetry(seq)) { bad = true; break; }
-      fpsBuf[i].push(fp);
-    }
+    // Run DFS to find all new cycles and validate them inline.
+    dfsVis[bot] = 1; // mark starting node (`to`)
+    dfsFrom      = top;
+    dfsEdgeColor = col;
+    dfsCycCount  = 0;
+    dfsBad       = false;
+    dfsDepth     = 0;
+    curFpBuf     = fpsBuf[i];
+    curFpBuf.length = 0;
 
-    if (bad) {
-      // Undo edges 0..i-1 from adj (edge i was never added)
-      for (let j = i - 1; j >= 0; j--) adjRemove(pairs[j].top, pairs[j].bot, pairs[j].color);
+    dfs(bot);
+
+    dfsVis[bot] = 0; // unmark starting node
+
+    if (dfsBad) {
+      // Undo adj mutations for edges 0..i-1 (edge i was never added).
+      for (let j = i - 1; j >= 0; j--) adjRemoveI(pairsTop[j], pairsBot[j], pairsCol[j]);
       return false;
     }
 
+    // Commit this edge's fingerprints to the global set.
     for (const fp of fpsBuf[i]) fpSet.add(fp);
-    adjAdd(top, bot, color);
+    adjAddI(top, bot, col);
   }
-  return true; // adj has all N cross-edges committed
+  return true; // all N cross-edges are now in adj
 }
 
 // Remove all N cross-edges after a valid attempt.
-function undoAll() {
-  for (let i = N - 1; i >= 0; i--) adjRemove(pairs[i].top, pairs[i].bot, pairs[i].color);
+function undoAll(): void {
+  for (let i = N - 1; i >= 0; i--) adjRemoveI(pairsTop[i], pairsBot[i], pairsCol[i]);
 }
 
-// ── Solution dedup key ────────────────────────────────────────────────────────
-// Sorted so the key is order-independent (matching the audit worker's approach).
+// Solution dedup key: sorted canonical strings (order-independent).
 function solutionKey(): string {
-  return pairs.map(p => `${p.top}|${p.bot}|${p.color}`).sort().join('~');
+  const parts = new Array<string>(N);
+  for (let i = 0; i < N; i++) {
+    parts[i] = `${nodeIdxToId[pairsTop[i]]}|${nodeIdxToId[pairsBot[i]]}|${COLORS[pairsCol[i]]}`;
+  }
+  return parts.sort().join('~');
 }
 
 // ── Search state ──────────────────────────────────────────────────────────────
-let stopped    = false;
-let attempts   = 0;
-let validFound = 0;
-let seenKeys:  Set<string>;
-let gen        = 0;
-let startTime  = 0;
+let stopped     = false;
+let attempts    = 0;
+let validFound  = 0;
+let seenKeys:   Set<string>;
+let gen         = 0;
+let startTime   = 0;
+
+// Metrics
+let lastProgressTime    = 0;
+let uiUpdates           = 0;
+let batchCount          = 0;
+let attemptsAtLastBatch = 0;
+let lastBatchTime       = 0;
 
 // ── Batch runner ──────────────────────────────────────────────────────────────
-function runBatch() {
+function runBatch(): void {
   if (stopped) {
     ctx.postMessage({ type: 'STOPPED', attempts, validFound });
     return;
   }
 
-  const t0 = performance.now();
+  const batchStart      = performance.now();
+  const batchStartAtpts = attempts;
+
   outer:
-  while (performance.now() - t0 < BATCH_MS) {
+  while (performance.now() - batchStart < BATCH_MS) {
     for (let i = 0; i < INNER_N; i++) {
       if (stopped) break outer;
       attempts++;
 
       if (!tryOne()) continue;
 
-      // Valid solution — check dedup
+      // Valid — dedup check
       const key = solutionKey();
       if (!seenKeys.has(key)) {
         seenKeys.add(key);
         validFound++;
-        const connections: ConnectionSnapshot[] = pairs.map(p => ({
-          from: p.top, to: p.bot, color: p.color,
-        }));
+        const connections: ConnectionSnapshot[] = [];
+        for (let j = 0; j < N; j++) {
+          connections.push({ from: nodeIdxToId[pairsTop[j]], to: nodeIdxToId[pairsBot[j]], color: COLORS[pairsCol[j]] });
+        }
         const snap: SolutionSnapshot = {
-          id:          `rand-${Date.now()}-${validFound}`,
-          generation:  gen,
+          id:         `rand-${Date.now()}-${validFound}`,
+          generation: gen,
           connections,
-          timestamp:   Date.now(),
+          timestamp:  Date.now(),
         };
         ctx.postMessage({ type: 'SOLUTION', solution: snap });
       }
 
-      undoAll(); // restore adj to tree-only for next attempt
+      undoAll();
     }
   }
 
-  const elapsed = (performance.now() - startTime) / 1000;
-  ctx.postMessage({
-    type:            'PROGRESS',
-    attempts,
-    validFound,
-    attemptsPerSec:  elapsed > 0.5 ? Math.round(attempts / elapsed) : 0,
-  });
+  batchCount++;
+  const now        = performance.now();
+  const elapsed    = (now - startTime) / 1000;
+  const batchElap  = (now - batchStart) / 1000;
+  const batchDelta = attempts - batchStartAtpts;
+
+  if (now - lastProgressTime >= PROGRESS_MS) {
+    lastProgressTime = now;
+    uiUpdates++;
+    ctx.postMessage({
+      type:                    'PROGRESS',
+      attempts,
+      validFound,
+      attemptsPerSecCurrent:   batchElap > 0 ? Math.round(batchDelta / batchElap) : 0,
+      attemptsPerSecAvg:       elapsed   > 0.5 ? Math.round(attempts / elapsed) : 0,
+      uptime:                  elapsed,
+      uiUpdates,
+      avgBatchSize:            Math.round(attempts / batchCount),
+    });
+    attemptsAtLastBatch = attempts;
+    lastBatchTime       = now;
+  }
 
   setTimeout(runBatch, 0); // yield to event loop (allows STOP to be processed)
 }
@@ -237,40 +386,74 @@ ctx.onmessage = (e: MessageEvent) => {
     gen: number; topGraph: Graph; bottomGraph: Graph;
   };
 
-  gen       = g;
-  stopped   = false;
-  attempts  = 0;
+  gen        = g;
+  stopped    = false;
+  attempts   = 0;
   validFound = 0;
-  seenKeys  = new Set();
-  startTime = performance.now();
-  seed      = (Date.now() ^ (Math.random() * 0x80000000 | 0)) | 0;
+  seenKeys   = new Set();
+  startTime  = performance.now();
+  lastProgressTime    = 0;
+  uiUpdates           = 0;
+  batchCount          = 0;
+  attemptsAtLastBatch = 0;
+  lastBatchTime       = 0;
+  seed = (Date.now() ^ (Math.random() * 0x80000000 | 0)) | 0;
 
-  topFrontier = topGraph.nodes.filter(n => n.isFrontier);
-  botFrontier = bottomGraph.nodes.filter(n => n.isFrontier);
-  N           = topFrontier.length;
+  // Build integer node index mapping.
+  const allNodes = [...topGraph.nodes, ...bottomGraph.nodes];
+  const idToIdx  = new Map<string, number>();
+  nodeIdxToId    = [];
+  for (const n of allNodes) {
+    idToIdx.set(n.id, nodeIdxToId.length);
+    nodeIdxToId.push(n.id);
+  }
+  const nodeCount = nodeIdxToId.length;
 
-  // Build parent colors (Rule A: frontier node's parent-edge color is forbidden)
-  parentColor = new Map();
-  const fids = new Set([...topFrontier, ...botFrontier].map(n => n.id));
-  for (const e of topGraph.edges)    if (fids.has(e.targetId)) parentColor.set(e.targetId, e.color);
-  for (const e of bottomGraph.edges) if (fids.has(e.targetId)) parentColor.set(e.targetId, e.color);
+  // Build parentColorI (Rule A: frontier node's single tree parent-edge color).
+  parentColorI = new Uint8Array(nodeCount).fill(255); // 255 = no constraint
+  const colorToInt: Record<string, number> = { red: 0, green: 1, blue: 2 };
+  const frontierIds = new Set<number>();
+  for (const n of topGraph.nodes)    if (n.isFrontier) frontierIds.add(idToIdx.get(n.id)!);
+  for (const n of bottomGraph.nodes) if (n.isFrontier) frontierIds.add(idToIdx.get(n.id)!);
+  for (const e of topGraph.edges) {
+    const tid = idToIdx.get(e.targetId);
+    if (tid !== undefined && frontierIds.has(tid)) parentColorI[tid] = colorToInt[e.color];
+  }
+  for (const e of bottomGraph.edges) {
+    const tid = idToIdx.get(e.targetId);
+    if (tid !== undefined && frontierIds.has(tid)) parentColorI[tid] = colorToInt[e.color];
+  }
 
-  // Build tree-only adj (cross-edges added/removed per attempt during search)
-  adj = new Map();
-  for (const n of topGraph.nodes)    adj.set(n.id, []);
-  for (const n of bottomGraph.nodes) adj.set(n.id, []);
-  for (const e of topGraph.edges)    adjAdd(e.sourceId, e.targetId, e.color);
-  for (const e of bottomGraph.edges) adjAdd(e.sourceId, e.targetId, e.color);
+  // Build integer adjacency (tree edges only; cross-edges added per attempt).
+  adjDeg.fill(0, 0, nodeCount);
+  for (const e of topGraph.edges) {
+    adjAddI(idToIdx.get(e.sourceId)!, idToIdx.get(e.targetId)!, colorToInt[e.color]);
+  }
+  for (const e of bottomGraph.edges) {
+    adjAddI(idToIdx.get(e.sourceId)!, idToIdx.get(e.targetId)!, colorToInt[e.color]);
+  }
 
-  // Pre-allocate per-attempt buffers (reused every iteration)
-  perm   = Array.from({ length: N }, (_, i) => i);
-  pairs  = Array.from({ length: N }, () => ({ top: '', bot: '', color: 'red' as EdgeColor }));
-  fpsBuf = Array.from({ length: N }, () => []);
-  fpSet  = new Set();
+  // Frontier index arrays.
+  const topFront = topGraph.nodes.filter(n => n.isFrontier);
+  const botFront = bottomGraph.nodes.filter(n => n.isFrontier);
+  N = topFront.length;
+
+  topFrontierIdx = new Uint16Array(N);
+  botFrontierIdx = new Uint16Array(N);
+  for (let i = 0; i < N; i++) topFrontierIdx[i] = idToIdx.get(topFront[i].id)!;
+  for (let i = 0; i < N; i++) botFrontierIdx[i] = idToIdx.get(botFront[i].id)!;
+
+  // Pre-allocated per-attempt buffers.
+  pairsTop = new Uint16Array(N);
+  pairsBot = new Uint16Array(N);
+  pairsCol = new Uint8Array(N);
+  perm     = Uint16Array.from({ length: N }, (_, i) => i);
+  fpsBuf   = Array.from({ length: N }, () => [] as string[]);
+  fpSet    = new Set();
 
   ctx.postMessage({ type: 'ACK' });
 
-  if (N === 0 || N !== botFrontier.length) {
+  if (N === 0 || N !== botFront.length) {
     ctx.postMessage({ type: 'STOPPED', attempts: 0, validFound: 0 });
     return;
   }

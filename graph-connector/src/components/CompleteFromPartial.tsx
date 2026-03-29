@@ -8,7 +8,7 @@ import type { ConnectionSnapshot, SolutionSnapshot } from '../types/solution';
 import type { SearchMode, SearchProgress, SearchResult } from '../solver/matchingSearch';
 import type { DebugInfo } from '../solver/completeWorker';
 import { MAX_SEARCH_GEN } from '../solver/matchingSearch';
-import { loadSolutions, appendSolutions } from '../storage/solutions';
+import { appendSolutions } from '../storage/solutions';
 import { EDGE_COLORS } from './GraphView';
 
 interface Props {
@@ -102,11 +102,11 @@ export default function CompleteFromPartial({
       } else if (type === 'DONE') {
         const { solutions: finalSols, progress: finalProg } =
           (e.data as { type: string; result: SearchResult }).result;
-        appendSolutions(finalSols.filter(s => isCompleteSolution(s, runExpectedPairs)));
-        setSolutions(
-          loadSolutions()
-            .filter(s => s.generation === gen && isCompleteSolution(s, runExpectedPairs)),
-        );
+        const validFinalSols = finalSols.filter(s => isCompleteSolution(s, runExpectedPairs));
+        appendSolutions(validFinalSols);
+        // Use only this run's solutions — do NOT reload from localStorage, which
+        // would mix in solutions from previous Search Mode / prior completion runs.
+        setSolutions(validFinalSols);
         setProgress(finalProg);
         setRunning(false);
         workerRef.current = null;

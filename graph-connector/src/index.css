@@ -1282,4 +1282,33 @@ body {
   color: #8888aa;
 }
 
+.random-diag {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.random-diag-title {
+  font-size: 0.7rem;
+  color: #44445a;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.random-stats--diag {
+  gap: 8px;
+}
+
+.random-stat--sm {
+  min-width: 74px;
+  padding: 6px 10px;
+  background: #141420;
+  border-color: #222238;
+}
+
+.random-stat-value--dim {
+  font-size: 0.92rem;
+  color: #6666aa;
+}
+
 #root { min-height: 100vh; }
