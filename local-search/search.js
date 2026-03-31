@@ -45,9 +45,8 @@ const COLORS     = ['red', 'green', 'blue'];
 const COLOR_CHAR = 'rgb';           // int 0/1/2 → char used in fingerprint strings
 const INNER_N    = 1_000;           // iterations between stop-flag checks and time reads
 const CHECK_CAP  = 10_000;          // max cycle paths per edge — matches validateGraph.ts
-const PROGRESS_INTERVAL_MS  = 5_000;
-const CHECKPOINT_INTERVAL   = 20_000_000;
-const STATUS_INTERVAL_MS    = 5 * 60 * 1000; // 5-minute heartbeat
+const CHECKPOINT_INTERVAL = 20_000_000;
+const STATUS_INTERVAL_MS  = 5 * 60 * 1000; // 5-minute heartbeat
 
 const MAX_NODES = 512;
 const MAX_DEG   = 8;
@@ -414,8 +413,7 @@ function main() {
   let validFound       = solutions.length;
   let stopped          = false;
   const startTime      = performance.now();
-  let lastProgressTime = startTime;
-  let lastStatusTime   = startTime;   // tracks 5-minute heartbeat
+  let lastStatusTime = startTime; // tracks 5-minute heartbeat
   let nextCheckpoint   = (Math.floor(baseAttempts / CHECKPOINT_INTERVAL) + 1)
                          * CHECKPOINT_INTERVAL - baseAttempts;
   if (nextCheckpoint <= 0) nextCheckpoint = CHECKPOINT_INTERVAL;
@@ -469,30 +467,17 @@ function main() {
       undoAll();
     }
 
-    // ── Time reads and periodic output ───────────────────────────────────────
-    const now        = performance.now();
-    const elapsed    = (now - startTime) / 1000;
-    const blockElap  = (now - blockStart) / 1000;
-    const blockDelta = attempts - blockStartAtpts;
-    const curRate    = blockElap > 0 ? Math.round(blockDelta / blockElap) : 0;
-    const avgRate    = elapsed   > 0.5 ? Math.round(attempts / elapsed)   : 0;
-    const total      = baseAttempts + attempts;
-
-    // 5-second progress line (lightweight, no file I/O)
-    if (now - lastProgressTime >= PROGRESS_INTERVAL_MS) {
-      lastProgressTime = now;
-      process.stdout.write(
-        `  ${fmt(total)} attempts | ${fmtRate(curRate)} (cur) ${fmtRate(avgRate)} (avg) | ${validFound} valid | ${fmtTime(elapsed)}\n`
-      );
-    }
-
-    // 5-minute heartbeat: status line + checkpoint save
+    // ── 5-minute heartbeat: status line + checkpoint save ────────────────────
+    const now     = performance.now();
+    const elapsed = (now - startTime) / 1000;
     if (now - lastStatusTime >= STATUS_INTERVAL_MS) {
       lastStatusTime = now;
-      saveCheckpointFile(total, validFound);
+      const total   = baseAttempts + attempts;
+      const avgRate = elapsed > 0.5 ? Math.round(attempts / elapsed) : 0;
       const hh = String(Math.floor(elapsed / 3600)).padStart(2, '0');
       const mm = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
       const ss = String(Math.floor(elapsed % 60)).padStart(2, '0');
+      saveCheckpointFile(total, validFound);
       console.log(`5min update -> ${fmt(total)} attempts | ${fmtRate(avgRate)} avg | ${validFound} valid | ${hh}:${mm}:${ss} runtime`);
     }
   }
