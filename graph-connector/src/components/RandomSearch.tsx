@@ -1,12 +1,12 @@
-// RandomSearch.tsx — Monte Carlo random graph search UI.
+// RandomSearch.tsx — two coexisting workflows:
 //
-// Runs the search in a browser Web Worker (local, no backend needed).
-// Found solutions can be exported as JSON or imported from a JSON file
-// produced by the local Node runner (local-search/search.js).
+//  1. BROWSER  — runs search in a Web Worker right in the tab.
+//               Convenient for quick exploration; speed limited by browser.
 //
-// Continuously generates random perfect matchings with random colors,
-// validates each one, and emits valid solutions until stopped.
-// Progress is checkpointed to localStorage every 20,000,000 attempts.
+//  2. IMPORT   — import a solutions JSON file produced by the local Node
+//               runner (local-search/search.js) for heavier/faster runs.
+//
+// Both modes display solutions as clickable cards that load into the graph.
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Graph } from '../types/graph';
@@ -32,74 +32,71 @@ interface RandomStats {
 }
 
 // ── localStorage checkpoint helpers ──────────────────────────────────────────
-interface CheckpointData {
-  attempts:   number;
-  validFound: number;
-  timestamp:  number;
-}
+interface CheckpointData { attempts: number; validFound: number; timestamp: number; }
 
-function ckptKey(gen: number): string { return `rnd-ckpt-g${gen}`; }
-
+function ckptKey(gen: number) { return `rnd-ckpt-g${gen}`; }
 function loadCheckpoint(gen: number): CheckpointData | null {
-  try {
-    const raw = localStorage.getItem(ckptKey(gen));
-    return raw ? (JSON.parse(raw) as CheckpointData) : null;
-  } catch { return null; }
+  try { const r = localStorage.getItem(ckptKey(gen)); return r ? JSON.parse(r) : null; }
+  catch { return null; }
 }
-
-function saveCheckpoint(gen: number, data: CheckpointData): void {
-  try { localStorage.setItem(ckptKey(gen), JSON.stringify(data)); } catch { /* quota/private */ }
+function saveCheckpoint(gen: number, d: CheckpointData) {
+  try { localStorage.setItem(ckptKey(gen), JSON.stringify(d)); } catch { /* quota */ }
 }
-
-function clearCheckpoint(gen: number): void {
+function clearCheckpoint(gen: number) {
   try { localStorage.removeItem(ckptKey(gen)); } catch { /* ignore */ }
 }
 
-function formatCount(n: number): string {
+// ── Formatters ────────────────────────────────────────────────────────────────
+function fmtCount(n: number) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
 }
-
-function formatRate(n: number): string {
+function fmtRate(n: number) {
   if (n === 0) return '—';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M/s`;
   if (n >= 1_000)     return `${(n / 1_000).toFixed(0)}k/s`;
   return `${n}/s`;
 }
-
-function formatUptime(sec: number): string {
-  if (sec < 60)  return `${sec.toFixed(1)}s`;
+function fmtUptime(sec: number) {
+  if (sec < 60) return `${sec.toFixed(1)}s`;
   const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
   return `${m}m ${s}s`;
 }
 
-export default function RandomSearch({
-  gen, topGraph, bottomGraph, onLoadSolution,
-}: Props) {
-  const [running,   setRunning]   = useState(false);
-  const [solutions, setSolutions] = useState<SolutionSnapshot[]>([]);
-  const [stats,     setStats]     = useState<RandomStats | null>(null);
-  const [stopped,   setStopped]   = useState(false);
-  const [lastCkpt,  setLastCkpt]  = useState<CheckpointData | null>(null);
-  const [importErr, setImportErr] = useState<string | null>(null);
+// ── Component ─────────────────────────────────────────────────────────────────
+export default function RandomSearch({ gen, topGraph, bottomGraph, onLoadSolution }: Props) {
+  // 'browser' | 'import' — which sub-panel is expanded
+  const [activeTab, setActiveTab] = useState<'browser' | 'import'>('browser');
+
+  // ── Browser search state ───────────────────────────────────────────────────
+  const [running,       setRunning]       = useState(false);
+  const [browserSols,   setBrowserSols]   = useState<SolutionSnapshot[]>([]);
+  const [stats,         setStats]         = useState<RandomStats | null>(null);
+  const [stopped,       setStopped]       = useState(false);
+  const [lastCkpt,      setLastCkpt]      = useState<CheckpointData | null>(null);
+
+  // ── Import state ───────────────────────────────────────────────────────────
+  const [importedSols,  setImportedSols]  = useState<SolutionSnapshot[]>([]);
+  const [importErr,     setImportErr]     = useState<string | null>(null);
+  const [importMsg,     setImportMsg]     = useState<string | null>(null);
 
   const workerRef      = useRef<Worker | null>(null);
   const baseAttempts   = useRef(0);
   const baseValidFound = useRef(0);
   const importRef      = useRef<HTMLInputElement>(null);
 
-  // Terminate worker on unmount.
   useEffect(() => () => { workerRef.current?.terminate(); }, []);
 
-  // Restore checkpoint and reset when gen changes.
+  // Reset when gen changes.
   useEffect(() => {
     workerRef.current?.terminate();
     workerRef.current = null;
     setRunning(false);
-    setSolutions([]);
+    setBrowserSols([]);
     setStopped(false);
     setImportErr(null);
+    setImportMsg(null);
 
     const ckpt = loadCheckpoint(gen);
     baseAttempts.current   = ckpt?.attempts   ?? 0;
@@ -112,9 +109,10 @@ export default function RandomSearch({
     } : null);
   }, [gen]);
 
+  // ── Browser search handlers ────────────────────────────────────────────────
   const handleStart = useCallback(() => {
     workerRef.current?.terminate();
-    setSolutions([]);
+    setBrowserSols([]);
     setRunning(true);
     setStopped(false);
 
@@ -123,17 +121,14 @@ export default function RandomSearch({
       { type: 'module' },
     );
     workerRef.current = worker;
-
-    const base   = baseAttempts.current;
-    const baseVF = baseValidFound.current;
+    const base = baseAttempts.current, baseVF = baseValidFound.current;
 
     worker.onmessage = (e: MessageEvent) => {
       const msg = e.data as { type: string } & Record<string, unknown>;
-
       if (msg.type === 'SOLUTION') {
         const sol = msg.solution as SolutionSnapshot;
         appendSolutions([sol]);
-        setSolutions(prev => [...prev, sol]);
+        setBrowserSols(prev => [...prev, sol]);
       } else if (msg.type === 'PROGRESS') {
         setStats({
           attempts:              base   + (msg.attempts   as number),
@@ -145,9 +140,11 @@ export default function RandomSearch({
           avgBatchSize:          msg.avgBatchSize           as number,
         });
       } else if (msg.type === 'CHECKPOINT') {
-        const totalAttempts   = base   + (msg.attempts   as number);
-        const totalValidFound = baseVF + (msg.validFound as number);
-        const ckpt: CheckpointData = { attempts: totalAttempts, validFound: totalValidFound, timestamp: Date.now() };
+        const ckpt: CheckpointData = {
+          attempts:   base + (msg.attempts   as number),
+          validFound: baseVF + (msg.validFound as number),
+          timestamp:  Date.now(),
+        };
         saveCheckpoint(gen, ckpt);
         setLastCkpt(ckpt);
       } else if (msg.type === 'STOPPED') {
@@ -161,68 +158,49 @@ export default function RandomSearch({
         workerRef.current = null;
       }
     };
-
-    worker.onerror = () => {
-      setRunning(false);
-      workerRef.current = null;
-    };
-
+    worker.onerror = () => { setRunning(false); workerRef.current = null; };
     worker.postMessage({ type: 'START', payload: { gen, topGraph, bottomGraph, baseAttempts: base } });
   }, [gen, topGraph, bottomGraph]);
 
-  const handleStop = useCallback(() => {
-    workerRef.current?.postMessage({ type: 'STOP' });
-  }, []);
-
+  const handleStop  = useCallback(() => { workerRef.current?.postMessage({ type: 'STOP' }); }, []);
   const handleClear = useCallback(() => {
     clearCheckpoint(gen);
-    baseAttempts.current   = 0;
-    baseValidFound.current = 0;
-    setSolutions([]);
-    setStats(null);
-    setStopped(false);
-    setLastCkpt(null);
+    baseAttempts.current = 0; baseValidFound.current = 0;
+    setBrowserSols([]); setStats(null); setStopped(false); setLastCkpt(null);
   }, [gen]);
 
-  // Export currently displayed solutions as JSON.
   const handleExport = useCallback(() => {
-    if (solutions.length === 0) return;
-    const blob = new Blob([JSON.stringify(solutions, null, 2)], { type: 'application/json' });
+    if (browserSols.length === 0) return;
+    const blob = new Blob([JSON.stringify(browserSols, null, 2)], { type: 'application/json' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
-    a.href     = url;
-    a.download = `solutions-gen${gen}.json`;
-    a.click();
+    a.href = url; a.download = `solutions-gen${gen}.json`; a.click();
     URL.revokeObjectURL(url);
-  }, [solutions, gen]);
+  }, [browserSols, gen]);
 
-  // Import solutions from a JSON file (produced by local-search/search.js or exported earlier).
+  // ── Import handler ─────────────────────────────────────────────────────────
   const handleImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    setImportErr(null);
+    setImportErr(null); setImportMsg(null);
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
         const raw = JSON.parse(ev.target?.result as string) as SolutionSnapshot[];
         if (!Array.isArray(raw)) throw new Error('Expected a JSON array.');
-        const filtered = raw.filter(s =>
-          s && typeof s.generation === 'number' && Array.isArray(s.connections)
-        );
-        const forThisGen = filtered.filter(s => s.generation === gen);
-        if (filtered.length > 0 && forThisGen.length === 0) {
-          setImportErr(`File has ${filtered.length} solution(s) but none for gen ${gen}.`);
+        const valid     = raw.filter(s => s && typeof s.generation === 'number' && Array.isArray(s.connections));
+        const forGen    = valid.filter(s => s.generation === gen);
+        if (valid.length > 0 && forGen.length === 0) {
+          setImportErr(`File has ${valid.length} solution(s) but none for gen ${gen}.`);
           return;
         }
-        appendSolutions(forThisGen);
-        setSolutions(prev => {
+        if (forGen.length === 0) { setImportErr('No valid solutions found in file.'); return; }
+        appendSolutions(forGen);
+        setImportedSols(prev => {
           const existingIds = new Set(prev.map(s => s.id));
-          const newOnes = forThisGen.filter(s => !existingIds.has(s.id));
-          return [...prev, ...newOnes];
+          return [...prev, ...forGen.filter(s => !existingIds.has(s.id))];
         });
-        if (forThisGen.length === 0) {
-          setImportErr('No valid solutions found in the file.');
-        }
+        setImportMsg(`Imported ${forGen.length} solution${forGen.length !== 1 ? 's' : ''} for gen ${gen}.`);
       } catch {
         setImportErr('Import failed: file must be a valid solutions JSON array.');
       }
@@ -231,147 +209,208 @@ export default function RandomSearch({
     e.target.value = '';
   }, [gen]);
 
+  const handleClearImported = useCallback(() => {
+    setImportedSols([]); setImportErr(null); setImportMsg(null);
+  }, []);
+
   const hitRate = (stats && stats.attempts > 0)
     ? ((stats.validFound / stats.attempts) * 100).toFixed(3)
     : null;
 
   return (
     <div className="random-panel">
-      <div className="random-controls">
-        {!running ? (
-          <button className="random-start-btn" onClick={handleStart}>
-            Start Random Search
-          </button>
-        ) : (
-          <button className="random-stop-btn" onClick={handleStop}>
-            Stop
-          </button>
-        )}
+
+      {/* ── Mode selector tabs ─────────────────────────────────────────────── */}
+      <div className="search-mode-selector" style={{ marginBottom: '12px' }}>
         <button
-          className="random-clear-btn"
-          onClick={handleClear}
-          disabled={running || (solutions.length === 0 && !stats)}
+          className={`search-mode-btn${activeTab === 'browser' ? ' search-mode-btn--active' : ''}`}
+          onClick={() => setActiveTab('browser')}
         >
-          Clear
+          Run in Browser
         </button>
         <button
-          className="search-export-btn"
-          onClick={handleExport}
-          disabled={solutions.length === 0}
-          title="Save found solutions as a JSON file"
+          className={`search-mode-btn${activeTab === 'import' ? ' search-mode-btn--active' : ''}`}
+          onClick={() => setActiveTab('import')}
         >
-          Export JSON
+          Import Local Results
         </button>
-        <button
-          className="search-import-btn"
-          onClick={() => importRef.current?.click()}
-          disabled={running}
-          title="Import solutions found by local-search/search.js"
-        >
-          Import JSON
-        </button>
-        <input
-          ref={importRef}
-          type="file"
-          accept=".json"
-          style={{ display: 'none' }}
-          onChange={handleImport}
-        />
       </div>
 
-      {importErr && (
-        <p className="search-frontier-error">{importErr}</p>
-      )}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {/* BROWSER PANEL                                                        */}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {activeTab === 'browser' && (
+        <div>
+          <p className="random-starting" style={{ marginTop: 0, marginBottom: '10px' }}>
+            Runs directly in your browser using a Web Worker.
+            Convenient for quick exploration — typically <strong>40–80k/s</strong>.
+            For long heavy runs use the local Node runner and import here.
+          </p>
 
-      {stats && (
-        <>
-          <div className="random-stats">
-            <div className="random-stat">
-              <span className="random-stat-label">Attempts</span>
-              <span className="random-stat-value">{formatCount(stats.attempts)}</span>
-            </div>
-            <div className="random-stat">
-              <span className="random-stat-label">Valid found</span>
-              <span className="random-stat-value random-stat-value--found">{stats.validFound}</span>
-            </div>
-            <div className="random-stat">
-              <span className="random-stat-label">Rate (cur)</span>
-              <span className="random-stat-value">{formatRate(stats.attemptsPerSecCurrent)}</span>
-            </div>
-            <div className="random-stat">
-              <span className="random-stat-label">Rate (avg)</span>
-              <span className="random-stat-value">{formatRate(stats.attemptsPerSecAvg)}</span>
-            </div>
-            {hitRate !== null && (
-              <div className="random-stat">
-                <span className="random-stat-label">Hit rate</span>
-                <span className="random-stat-value">{hitRate}%</span>
-              </div>
+          <div className="random-controls">
+            {!running ? (
+              <button className="random-start-btn" onClick={handleStart}>
+                Start Random Search
+              </button>
+            ) : (
+              <button className="random-stop-btn" onClick={handleStop}>Stop</button>
             )}
+            <button
+              className="random-clear-btn"
+              onClick={handleClear}
+              disabled={running || (browserSols.length === 0 && !stats)}
+            >Clear</button>
+            <button
+              className="search-export-btn"
+              onClick={handleExport}
+              disabled={browserSols.length === 0}
+              title="Save found solutions as JSON"
+            >Export JSON</button>
           </div>
 
-          <div className="random-diag">
-            <span className="random-diag-title">Diagnostics</span>
-            <div className="random-stats random-stats--diag">
-              <div className="random-stat random-stat--sm">
-                <span className="random-stat-label">Uptime</span>
-                <span className="random-stat-value random-stat-value--dim">{formatUptime(stats.uptime)}</span>
+          {stats && (
+            <>
+              <div className="random-stats">
+                <div className="random-stat">
+                  <span className="random-stat-label">Attempts</span>
+                  <span className="random-stat-value">{fmtCount(stats.attempts)}</span>
+                </div>
+                <div className="random-stat">
+                  <span className="random-stat-label">Valid found</span>
+                  <span className="random-stat-value random-stat-value--found">{stats.validFound}</span>
+                </div>
+                <div className="random-stat">
+                  <span className="random-stat-label">Rate (cur)</span>
+                  <span className="random-stat-value">{fmtRate(stats.attemptsPerSecCurrent)}</span>
+                </div>
+                <div className="random-stat">
+                  <span className="random-stat-label">Rate (avg)</span>
+                  <span className="random-stat-value">{fmtRate(stats.attemptsPerSecAvg)}</span>
+                </div>
+                {hitRate !== null && (
+                  <div className="random-stat">
+                    <span className="random-stat-label">Hit rate</span>
+                    <span className="random-stat-value">{hitRate}%</span>
+                  </div>
+                )}
               </div>
-              <div className="random-stat random-stat--sm">
-                <span className="random-stat-label">UI updates</span>
-                <span className="random-stat-value random-stat-value--dim">{stats.uiUpdates}</span>
+
+              <div className="random-diag">
+                <span className="random-diag-title">Diagnostics</span>
+                <div className="random-stats random-stats--diag">
+                  <div className="random-stat random-stat--sm">
+                    <span className="random-stat-label">Uptime</span>
+                    <span className="random-stat-value random-stat-value--dim">{fmtUptime(stats.uptime)}</span>
+                  </div>
+                  <div className="random-stat random-stat--sm">
+                    <span className="random-stat-label">UI updates</span>
+                    <span className="random-stat-value random-stat-value--dim">{stats.uiUpdates}</span>
+                  </div>
+                  <div className="random-stat random-stat--sm">
+                    <span className="random-stat-label">Avg batch</span>
+                    <span className="random-stat-value random-stat-value--dim">{fmtCount(stats.avgBatchSize)}</span>
+                  </div>
+                </div>
               </div>
-              <div className="random-stat random-stat--sm">
-                <span className="random-stat-label">Avg batch</span>
-                <span className="random-stat-value random-stat-value--dim">{formatCount(stats.avgBatchSize)}</span>
-              </div>
+            </>
+          )}
+
+          {lastCkpt && (
+            <p className="random-checkpoint">
+              Last checkpoint: {fmtCount(lastCkpt.attempts)} attempts
+              {' · '}{new Date(lastCkpt.timestamp).toLocaleTimeString()}
+            </p>
+          )}
+
+          {stopped && !running && (
+            <p className="random-stopped">
+              Stopped — {browserSols.length} solution{browserSols.length !== 1 ? 's' : ''} collected.
+            </p>
+          )}
+
+          {!stats && !running && (
+            <p className="random-starting">
+              Press <em>Start Random Search</em> to begin.
+            </p>
+          )}
+
+          {browserSols.length > 0 && (
+            <div className="solution-grid">
+              {browserSols.map(sol => (
+                <SolutionCard key={sol.id} solution={sol} onLoad={() => onLoadSolution(sol.connections)} />
+              ))}
             </div>
-          </div>
-        </>
+          )}
+        </div>
       )}
 
-      {lastCkpt && (
-        <p className="random-checkpoint">
-          Last checkpoint: {formatCount(lastCkpt.attempts)} attempts
-          {' · '}{new Date(lastCkpt.timestamp).toLocaleTimeString()}
-        </p>
-      )}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {/* IMPORT PANEL                                                         */}
+      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {activeTab === 'import' && (
+        <div>
+          <p className="random-starting" style={{ marginTop: 0, marginBottom: '10px' }}>
+            Import a <code>solutions-gen{gen}.json</code> file produced by the local Node runner
+            on your computer. The Node runner runs at <strong>~1M+/s</strong> and is better for
+            long or heavy searches.
+          </p>
+          <p className="random-starting" style={{ marginTop: 0, marginBottom: '14px', fontSize: '12px', opacity: 0.75 }}>
+            Run locally: <code>node local-search/search.js --gen {gen}</code>
+            {' '}then import the output file here.
+          </p>
 
-      {stopped && !running && (
-        <p className="random-stopped">
-          Stopped — {solutions.length} solution{solutions.length !== 1 ? 's' : ''} collected.
-        </p>
-      )}
-
-      {!stats && !running && (
-        <p className="random-starting">
-          Press <em>Start Random Search</em> to run in the browser,
-          or <em>Import JSON</em> to load solutions found by the local Node runner.
-        </p>
-      )}
-
-      {solutions.length > 0 && (
-        <div className="solution-grid">
-          {solutions.map(sol => (
-            <RandomSolutionCard
-              key={sol.id}
-              solution={sol}
-              onLoad={() => onLoadSolution(sol.connections)}
+          <div className="random-controls">
+            <button
+              className="search-import-btn"
+              onClick={() => importRef.current?.click()}
+              title="Import solutions-genN.json from local Node runner"
+            >
+              Import Solutions JSON
+            </button>
+            <button
+              className="random-clear-btn"
+              onClick={handleClearImported}
+              disabled={importedSols.length === 0}
+            >Clear</button>
+            <input
+              ref={importRef}
+              type="file"
+              accept=".json"
+              style={{ display: 'none' }}
+              onChange={handleImport}
             />
-          ))}
+          </div>
+
+          {importErr && <p className="search-frontier-error">{importErr}</p>}
+          {importMsg && (
+            <p className="random-checkpoint" style={{ color: '#3ab03a' }}>{importMsg}</p>
+          )}
+
+          {importedSols.length === 0 && !importErr && !importMsg && (
+            <p className="random-starting">
+              No solutions imported yet. Click <em>Import Solutions JSON</em> to load a file.
+            </p>
+          )}
+
+          {importedSols.length > 0 && (
+            <>
+              <p className="random-checkpoint">
+                {importedSols.length} solution{importedSols.length !== 1 ? 's' : ''} imported for gen {gen}.
+              </p>
+              <div className="solution-grid">
+                {importedSols.map(sol => (
+                  <SolutionCard key={sol.id} solution={sol} onLoad={() => onLoadSolution(sol.connections)} />
+                ))}
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function RandomSolutionCard({
-  solution,
-  onLoad,
-}: {
-  solution: SolutionSnapshot;
-  onLoad: () => void;
-}) {
+function SolutionCard({ solution, onLoad }: { solution: SolutionSnapshot; onLoad: () => void }) {
   return (
     <div className="solution-card">
       <div className="solution-card-header">
@@ -381,10 +420,7 @@ function RandomSolutionCard({
       <ul className="solution-edge-list">
         {solution.connections.map((c, i) => (
           <li key={i} className="solution-edge-item">
-            <span
-              className="solution-edge-dot"
-              style={{ background: EDGE_COLORS[c.color] }}
-            />
+            <span className="solution-edge-dot" style={{ background: EDGE_COLORS[c.color] }} />
             <span className="solution-edge-label">
               {c.from.replace(/^[^-]+-/, '')} → {c.to.replace(/^[^-]+-/, '')}
             </span>
