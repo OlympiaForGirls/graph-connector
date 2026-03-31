@@ -27,6 +27,14 @@ import type { ConnectionSnapshot } from './types/solution';
 import type { PartialPattern } from './types/partial';
 import './index.css';
 
+// ── RejectionOverlay ──────────────────────────────────────────────────────
+interface RejectionOverlay {
+  x1: number; y1: number;
+  x2: number; y2: number;
+  highlightNodeIds: ReadonlySet<string>;
+  highlightEdgeKeys: ReadonlySet<string>;
+}
+
 // ── CrossEdgeLayer ─────────────────────────────────────────────────────────
 // Looks up each endpoint in topPos first, then bottomPos.
 // This supports top↔bottom, top↔top, and bottom↔bottom pairings.
@@ -72,6 +80,63 @@ function CrossEdgeLayer({
   );
 }
 
+// ── CrossEdgeGlowLayer ────────────────────────────────────────────────────
+// Renders orange glow lines behind cross edges that are part of offending cycles.
+function CrossEdgeGlowLayer({
+  crossEdges, topPos, bottomPos, highlightEdgeKeys,
+}: {
+  crossEdges:       CrossEdge[];
+  topPos:           Record<string, { x: number; y: number }>;
+  bottomPos:        Record<string, { x: number; y: number }>;
+  highlightEdgeKeys: ReadonlySet<string> | null;
+}) {
+  if (!highlightEdgeKeys || highlightEdgeKeys.size === 0) return null;
+  return (
+    <g>
+      {crossEdges.map(edge => {
+        const a = topPos[edge.topNodeId]    ?? bottomPos[edge.topNodeId];
+        const b = topPos[edge.bottomNodeId] ?? bottomPos[edge.bottomNodeId];
+        if (!a || !b) return null;
+        const key = edge.topNodeId < edge.bottomNodeId
+          ? `${edge.topNodeId}|${edge.bottomNodeId}`
+          : `${edge.bottomNodeId}|${edge.topNodeId}`;
+        if (!highlightEdgeKeys.has(key)) return null;
+        return (
+          <line
+            key={edge.id}
+            x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+            stroke="#f5a623" strokeWidth={9} strokeLinecap="round" opacity={0.45}
+          />
+        );
+      })}
+    </g>
+  );
+}
+
+// ── GhostEdgeLayer ────────────────────────────────────────────────────────
+// Renders the rejected edge attempt as a dashed red line with an × mark.
+function GhostEdgeLayer({ overlay }: { overlay: RejectionOverlay | null }) {
+  if (!overlay) return null;
+  const { x1, y1, x2, y2 } = overlay;
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2;
+  return (
+    <g>
+      <line
+        x1={x1} y1={y1} x2={x2} y2={y2}
+        stroke="#e84040" strokeWidth={2} strokeDasharray="6 3"
+        strokeLinecap="round" opacity={0.5}
+      />
+      <text
+        x={mx} y={my + 6}
+        textAnchor="middle" fontSize={18} fontWeight={900}
+        fill="#e84040" opacity={0.85}
+        style={{ pointerEvents: 'none', userSelect: 'none' }}
+      >✕</text>
+    </g>
+  );
+}
+
 // ── CycleAnalysisRow ───────────────────────────────────────────────────────
 function CycleAnalysisRow({ a }: { a: CycleAnalysis }) {
   const flags: string[] = [];
@@ -109,6 +174,7 @@ export default function App() {
   const [gen, setGen]               = useState(2);
   const [mode, setMode]             = useState<'manual' | 'search' | 'partial' | 'complete' | 'audit' | 'random'>('manual');
   const [validation, setValidation] = useState<ValidationResult | null>(null);
+  const [rejection, setRejection]   = useState<RejectionOverlay | null>(null);
   const [showCycles, setShowCycles] = useState(true);
   const [selectedPartial, setSelectedPartial] = useState<PartialPattern | null>(null);
   const [debugResult, setDebugResult] = useState<GraphValidationResult | null>(null);
@@ -155,6 +221,7 @@ export default function App() {
   useEffect(() => {
     reset();
     setValidation(null);
+    setRejection(null);
   }, [gen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Absolute position maps — used by CrossEdgeLayer.
@@ -182,6 +249,7 @@ export default function App() {
       // First click: only select frontier nodes.
       if (node?.isFrontier) handleNodeClick(graphId, nodeId);
       setValidation(null);
+      setRejection(null);
       return;
     }
 
@@ -189,6 +257,7 @@ export default function App() {
     if (selectedNode.nodeId === nodeId || !node?.isFrontier) {
       clearSelection();
       setValidation(null);
+      setRejection(null);
       return;
     }
 
@@ -201,15 +270,26 @@ export default function App() {
     setValidation(result);
     if (result.allowed) {
       createEdge(selectedNode.nodeId, nodeId, pendingColor);
+      setRejection(null);
     } else {
+      const fromPos = topPos[selectedNode.nodeId] ?? bottomPos[selectedNode.nodeId];
+      const toPos   = topPos[nodeId] ?? bottomPos[nodeId];
+      if (fromPos && toPos) {
+        setRejection({
+          x1: fromPos.x, y1: fromPos.y,
+          x2: toPos.x,   y2: toPos.y,
+          highlightNodeIds: new Set(result.offendingNodeIds),
+          highlightEdgeKeys: new Set(result.offendingEdgeKeys),
+        });
+      }
       clearSelection();
     }
   }, [selectedNode, crossEdges, pendingColor, topGraph, bottomGraph,
-      allNodes, handleNodeClick, clearSelection, createEdge]);
+      allNodes, handleNodeClick, clearSelection, createEdge, topPos, bottomPos]);
 
-  const handleReset  = useCallback(() => { reset(); setValidation(null); setDebugResult(null); }, [reset]);
+  const handleReset  = useCallback(() => { reset(); setValidation(null); setRejection(null); setDebugResult(null); }, [reset]);
   const handleRemove = useCallback(
-    (id: string) => { removeCrossEdge(id); setValidation(null); setDebugResult(null); },
+    (id: string) => { removeCrossEdge(id); setValidation(null); setRejection(null); setDebugResult(null); },
     [removeCrossEdge],
   );
 
@@ -276,6 +356,13 @@ export default function App() {
             style={{ userSelect: 'none' }}
           >BOTTOM GRAPH</text>
 
+          {/* Cycle glow and ghost edge — behind cross edges and nodes */}
+          <CrossEdgeGlowLayer
+            crossEdges={crossEdges}
+            topPos={topPos} bottomPos={bottomPos}
+            highlightEdgeKeys={rejection?.highlightEdgeKeys ?? null}
+          />
+
           {/* Pairing edges drawn first (behind nodes) */}
           <CrossEdgeLayer
             crossEdges={crossEdges}
@@ -283,15 +370,21 @@ export default function App() {
             onRemove={handleRemove}
           />
 
+          <GhostEdgeLayer overlay={rejection} />
+
           <GraphView
             graph={topGraph}
             selectedNodeId={selectedNode?.graphId === 'top' ? selectedNode.nodeId : null}
             onNodeClick={mode === 'manual' ? handleClick : () => {}}
+            highlightNodeIds={rejection?.highlightNodeIds}
+            highlightEdgeKeys={rejection?.highlightEdgeKeys}
           />
           <GraphView
             graph={bottomGraph}
             selectedNodeId={selectedNode?.graphId === 'bot' ? selectedNode.nodeId : null}
             onNodeClick={mode === 'manual' ? handleClick : () => {}}
+            highlightNodeIds={rejection?.highlightNodeIds}
+            highlightEdgeKeys={rejection?.highlightEdgeKeys}
           />
         </svg>
       </main>

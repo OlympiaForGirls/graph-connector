@@ -310,6 +310,11 @@ let lastProgressTime = 0;
 let uiUpdates        = 0;
 let batchCount       = 0;
 
+// Checkpoint: send CHECKPOINT when (baseAttempts + attempts) hits a 20M multiple.
+// nextCheckpoint is the local-attempts value at which the next boundary is crossed.
+const CHECKPOINT_INTERVAL = 20_000_000;
+let nextCheckpoint = CHECKPOINT_INTERVAL; // reset at START
+
 // ── Batch runner ──────────────────────────────────────────────────────────────
 function runBatch(): void {
   if (stopped) {
@@ -325,6 +330,12 @@ function runBatch(): void {
     for (let i = 0; i < INNER_N; i++) {
       if (stopped) break outer;
       attempts++;
+
+      // Checkpoint: fires when total (base + local) crosses a 20M multiple.
+      if (attempts === nextCheckpoint) {
+        nextCheckpoint += CHECKPOINT_INTERVAL;
+        ctx.postMessage({ type: 'CHECKPOINT', attempts, validFound });
+      }
 
       if (!tryOne()) continue;
 
@@ -385,8 +396,8 @@ ctx.onmessage = (e: MessageEvent) => {
 
   if (msg.type !== 'START') return;
 
-  const { gen: g, topGraph, bottomGraph } = msg.payload as {
-    gen: number; topGraph: Graph; bottomGraph: Graph;
+  const { gen: g, topGraph, bottomGraph, baseAttempts = 0 } = msg.payload as {
+    gen: number; topGraph: Graph; bottomGraph: Graph; baseAttempts?: number;
   };
 
   gen        = g;
@@ -398,6 +409,9 @@ ctx.onmessage = (e: MessageEvent) => {
   lastProgressTime = 0;
   uiUpdates        = 0;
   batchCount       = 0;
+  // First checkpoint: at the local-attempts value that brings the total to the
+  // next 20M multiple above baseAttempts.
+  nextCheckpoint = (Math.floor(baseAttempts / CHECKPOINT_INTERVAL) + 1) * CHECKPOINT_INTERVAL - baseAttempts;
   seed = (Date.now() ^ (Math.random() * 0x80000000 | 0)) | 0;
 
   // Build integer node index mapping.

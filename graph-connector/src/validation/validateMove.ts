@@ -28,9 +28,20 @@ export interface ValidationResult {
   allCyclesAfter: Cycle[];
   anyRotationViolation: boolean;
   anyMirrorViolation: boolean;
+  /** Node IDs involved in offending cycles (for visual highlight). Empty on success. */
+  offendingNodeIds: string[];
+  /** Canonical edge keys "A|B" (lexicographically sorted) in offending cycles. Empty on success. */
+  offendingEdgeKeys: string[];
+  /** Node ID that triggered Rule A color conflict, or '' if not a Rule A failure. */
+  ruleAConflictNodeId: string;
 }
 
 // ── Helpers ───────────────────────────────────────────────────
+
+/** Canonical undirected edge key: smaller node ID first. */
+function edgeKey(a: string, b: string): string {
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
 
 /**
  * Returns true if `cycle` traverses the undirected edge (a, b).
@@ -76,6 +87,9 @@ export function validateMove(
       allCyclesAfter: [],
       anyRotationViolation: false,
       anyMirrorViolation: false,
+      offendingNodeIds: [colorCheck.conflictNodeId],
+      offendingEdgeKeys: [],
+      ruleAConflictNodeId: colorCheck.conflictNodeId,
     };
   }
 
@@ -95,6 +109,19 @@ export function validateMove(
   const { analyses, anyRotationViolation, anyMirrorViolation } =
     analyzeCycles(existingCycles, newCycles);
 
+  // Collect nodes and edges from cycles that violated a rule (for visual highlight).
+  const offNodeSet = new Set<string>();
+  const offEdgeSet = new Set<string>();
+  for (const a of analyses) {
+    if (!a.rejectedForRotation && !a.rejectedForMirror) continue;
+    for (const n of a.cycle.nodes) offNodeSet.add(n);
+    for (let i = 0; i < a.cycle.nodes.length; i++) {
+      offEdgeSet.add(edgeKey(a.cycle.nodes[i], a.cycle.nodes[(i + 1) % a.cycle.nodes.length]));
+    }
+  }
+  const offendingNodeIds  = [...offNodeSet];
+  const offendingEdgeKeys = [...offEdgeSet];
+
   if (anyRotationViolation) {
     return {
       allowed: false,
@@ -103,6 +130,9 @@ export function validateMove(
       allCyclesAfter,
       anyRotationViolation: true,
       anyMirrorViolation,
+      offendingNodeIds,
+      offendingEdgeKeys,
+      ruleAConflictNodeId: '',
     };
   }
 
@@ -114,6 +144,9 @@ export function validateMove(
       allCyclesAfter,
       anyRotationViolation: false,
       anyMirrorViolation: true,
+      offendingNodeIds,
+      offendingEdgeKeys,
+      ruleAConflictNodeId: '',
     };
   }
 
@@ -124,5 +157,8 @@ export function validateMove(
     allCyclesAfter,
     anyRotationViolation: false,
     anyMirrorViolation: false,
+    offendingNodeIds: [],
+    offendingEdgeKeys: [],
+    ruleAConflictNodeId: '',
   };
 }

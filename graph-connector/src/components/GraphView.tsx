@@ -23,9 +23,16 @@ interface GraphViewProps {
   /** The nodeId currently selected in this graph, or null. */
   selectedNodeId: string | null;
   onNodeClick: (graphId: string, nodeId: string) => void;
+  /** Node IDs to highlight with an orange glow ring (invalid-move feedback). */
+  highlightNodeIds?: ReadonlySet<string>;
+  /** Canonical edge keys "A|B" for tree edges to highlight orange. */
+  highlightEdgeKeys?: ReadonlySet<string>;
 }
 
-export default function GraphView({ graph, selectedNodeId, onNodeClick }: GraphViewProps) {
+export default function GraphView({
+  graph, selectedNodeId, onNodeClick,
+  highlightNodeIds, highlightEdgeKeys,
+}: GraphViewProps) {
   const nodeById = Object.fromEntries(graph.nodes.map(n => [n.id, n]));
 
   return (
@@ -35,27 +42,46 @@ export default function GraphView({ graph, selectedNodeId, onNodeClick }: GraphV
         const src = nodeById[edge.sourceId];
         const tgt = nodeById[edge.targetId];
         if (!src || !tgt) return null;
+        const ekey = edge.sourceId < edge.targetId
+          ? `${edge.sourceId}|${edge.targetId}`
+          : `${edge.targetId}|${edge.sourceId}`;
+        const isHighlighted = highlightEdgeKeys?.has(ekey) ?? false;
         return (
-          <line
-            key={edge.id}
-            x1={src.x} y1={src.y}
-            x2={tgt.x} y2={tgt.y}
-            stroke={EDGE_COLORS[edge.color]}
-            strokeWidth={3}
-            strokeLinecap="round"
-          />
+          <g key={edge.id}>
+            {isHighlighted && (
+              <line
+                x1={src.x} y1={src.y} x2={tgt.x} y2={tgt.y}
+                stroke="#f5a623" strokeWidth={9} strokeLinecap="round" opacity={0.45}
+              />
+            )}
+            <line
+              x1={src.x} y1={src.y}
+              x2={tgt.x} y2={tgt.y}
+              stroke={EDGE_COLORS[edge.color]}
+              strokeWidth={3}
+              strokeLinecap="round"
+            />
+          </g>
         );
       })}
 
       {/* Nodes — rendered above edges */}
       {graph.nodes.map(node => {
-        const isSelected = node.id === selectedNodeId;
+        const isSelected    = node.id === selectedNodeId;
+        const isHighlighted = highlightNodeIds?.has(node.id) ?? false;
         return (
           <g
             key={node.id}
             onClick={() => onNodeClick(graph.id, node.id)}
             style={{ cursor: 'pointer' }}
           >
+            {isHighlighted && (
+              <circle
+                cx={node.x} cy={node.y}
+                r={NODE_RADIUS + 9}
+                fill="none" stroke="#f5a623" strokeWidth={3} opacity={0.6}
+              />
+            )}
             {isSelected && (
               <circle
                 cx={node.x} cy={node.y}

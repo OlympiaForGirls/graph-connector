@@ -1282,6 +1282,12 @@ body {
   color: #8888aa;
 }
 
+.random-checkpoint {
+  font-size: 0.78rem;
+  color: #44445a;
+  font-variant-numeric: tabular-nums;
+}
+
 .random-diag {
   display: flex;
   flex-direction: column;

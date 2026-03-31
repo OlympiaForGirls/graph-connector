@@ -50,15 +50,15 @@ export function checkColorCompatibility(
   topGraph: Graph,
   bottomGraph: Graph,
   existingCrossEdges: CrossEdge[],
-): { ok: true } | { ok: false; reason: string } {
+): { ok: true } | { ok: false; reason: string; conflictNodeId: string } {
   const topColors    = getIncidentColors(topNodeId,    topGraph, bottomGraph, existingCrossEdges);
   const bottomColors = getIncidentColors(bottomNodeId, topGraph, bottomGraph, existingCrossEdges);
 
   if (topColors.has(color)) {
-    return { ok: false, reason: `${topNodeId} already has a ${color} edge — same color at endpoint.` };
+    return { ok: false, reason: `${topNodeId} already has a ${color} edge — same color at endpoint.`, conflictNodeId: topNodeId };
   }
   if (bottomColors.has(color)) {
-    return { ok: false, reason: `${bottomNodeId} already has a ${color} edge — same color at endpoint.` };
+    return { ok: false, reason: `${bottomNodeId} already has a ${color} edge — same color at endpoint.`, conflictNodeId: bottomNodeId };
   }
 
   return { ok: true };
