@@ -44,6 +44,13 @@ const state = {
 
 let workerThread = null;
 
+// ── SharedArrayBuffer stop flag ────────────────────────────────────────────────
+// Passed to the worker at construction time so it can be read via Atomics.load()
+// without ever yielding to the event loop.
+// stopFlag[0] = 0 → keep running, 1 → stop immediately after current INNER_N block.
+const stopBuf  = new SharedArrayBuffer(4);
+const stopFlag = new Int32Array(stopBuf);
+
 // ── Persistence ────────────────────────────────────────────────────────────────
 function loadPersisted() {
   try {
@@ -98,14 +105,20 @@ loadPersisted();
 function startWorker(gen) {
   // Terminate any existing worker first.
   if (workerThread) {
+    Atomics.store(stopFlag, 0, 1); // signal the old worker to stop
     workerThread.terminate();
     workerThread = null;
   }
 
+  // Clear the stop flag before starting a new worker.
+  Atomics.store(stopFlag, 0, 0);
+
   state.running = true;
   state.gen     = gen;
 
-  workerThread = new Worker(path.join(__dirname, 'searchWorker.js'));
+  workerThread = new Worker(path.join(__dirname, 'searchWorker.js'), {
+    workerData: { stopBuf }, // pass SharedArrayBuffer so worker can check stop flag inline
+  });
 
   workerThread.on('message', (msg) => {
     if (msg.type === 'PROGRESS') {
@@ -187,10 +200,10 @@ app.post('/start-random-search', (req, res) => {
 });
 
 // POST /stop-random-search
-// Sends STOP to the worker. The worker finishes its current batch then stops.
+// Sets the SharedArrayBuffer stop flag. The worker sees it within INNER_N iterations.
 app.post('/stop-random-search', (_req, res) => {
   if (workerThread) {
-    workerThread.postMessage({ type: 'STOP' });
+    Atomics.store(stopFlag, 0, 1); // worker's tight loop checks this every INNER_N iters
   } else {
     state.running = false;
   }
@@ -201,9 +214,11 @@ app.post('/stop-random-search', (_req, res) => {
 // Stops search and wipes all state and files. Useful for the Clear button.
 app.post('/reset-random-search', (_req, res) => {
   if (workerThread) {
+    Atomics.store(stopFlag, 0, 1);
     workerThread.terminate();
     workerThread = null;
   }
+  Atomics.store(stopFlag, 0, 0); // reset flag for next run
   state.running        = false;
   state.gen            = null;
   state.attempts       = 0;

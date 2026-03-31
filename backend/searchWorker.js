@@ -1,34 +1,30 @@
 // searchWorker.js — Node.js worker_threads port of randomWorker.ts.
 //
-// Same algorithm as the browser worker:
-//   • Integer adjacency (flat Uint16/Uint8 arrays, no Map in hot path)
-//   • Pre-allocated DFS scratch buffers (no heap allocation per cycle)
-//   • Inline dihedral canonical + mirror-symmetry check (Rule B + C)
-//   • LCG RNG, bitmask color selection (Rule A)
-//   • CHECK_CAP = 10,000 (matches browser worker and validateGraph.ts)
+// Key optimization vs original: uses SharedArrayBuffer stop flag so the
+// search loop NEVER yields to the event loop. The worker runs in a pure
+// tight CPU loop and checks the stop flag every INNER_N iterations via
+// Atomics.load() — zero setImmediate/setTimeout overhead.
 //
-// Message protocol (same as browser worker):
-//   parent → worker:  { type: 'START', gen, baseAttempts }
-//                     { type: 'STOP' }
-//   worker → parent:  { type: 'PROGRESS', attempts, validFound,
-//                         attemptsPerSecCurrent, attemptsPerSecAvg, uptime }
-//                     { type: 'SOLUTION', solution, key }
-//                     { type: 'CHECKPOINT', attempts, validFound }
-//                     { type: 'STOPPED', attempts, validFound }
+// postMessage() in worker_threads is non-blocking (puts data on channel,
+// parent processes it on its own event loop), so PROGRESS/SOLUTION/CHECKPOINT
+// messages can be sent without yielding.
 'use strict';
 
-const { parentPort }  = require('worker_threads');
-const { performance } = require('perf_hooks');
-const { generateGraph } = require('./graphGenerator.js');
+const { parentPort, workerData } = require('worker_threads');
+const { performance }             = require('perf_hooks');
+const { generateGraph }           = require('./graphGenerator.js');
+
+// SharedArrayBuffer stop flag: stopFlag[0] = 0 → run, 1 → stop.
+// Written by the parent thread via Atomics.store(); read here via Atomics.load().
+const stopFlag = new Int32Array(workerData.stopBuf);
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const COLORS     = ['red', 'green', 'blue'];
-const COLOR_CHAR = 'rgb';          // int 0/1/2 → char for fingerprint strings
-const BATCH_MS   = 100;            // ms per time-slice before yielding
-const INNER_N    = 200;            // inner iterations between perf.now() checks
-const CHECK_CAP  = 10_000;         // max cycle paths per edge (exact match with frontend)
-const PROGRESS_MS          = 5_000;       // 5 s between PROGRESS messages
-const CHECKPOINT_INTERVAL  = 20_000_000;  // save checkpoint every 20 M attempts
+const COLOR_CHAR = 'rgb';
+const INNER_N    = 1_000;   // iterations between stop-flag checks and time reads
+const CHECK_CAP  = 10_000;  // max cycle paths per edge (matches validateGraph.ts exactly)
+const PROGRESS_MS         = 5_000;
+const CHECKPOINT_INTERVAL = 20_000_000;
 
 const MAX_NODES = 512;
 const MAX_DEG   = 8;
@@ -64,7 +60,7 @@ function adjRemoveI(a, b, c) {
   }
 }
 
-// ── DFS scratch (pre-allocated, zero heap alloc in hot path) ─────────────────
+// ── DFS scratch (pre-allocated) ───────────────────────────────────────────────
 const dfsVis   = new Uint8Array(MAX_NODES);
 const colStack = new Uint8Array(MAX_DEPTH);
 const cycleBuf = new Uint8Array(MAX_DEPTH);
@@ -75,10 +71,9 @@ let dfsEdgeColor = 0;
 let dfsCycCount  = 0;
 let dfsBad       = false;
 let dfsDepth     = 0;
-let curFpBuf;      // points into fpsBuf[i] for the current edge
-let fpSet;         // Set<string> of fingerprints for the current attempt
+let curFpBuf;
+let fpSet;
 
-// ── Lexicographically smallest rotation — O(L²), no allocation ───────────────
 function minRotation(arr, len) {
   let best = 0;
   outer:
@@ -93,7 +88,6 @@ function minRotation(arr, len) {
   return best;
 }
 
-// ── Inline Rule B + C check — returns fingerprint or '' on violation ──────────
 function checkCycle(clen) {
   for (let i = 0; i < clen; i++) revBuf[i] = cycleBuf[clen - 1 - i];
 
@@ -113,10 +107,8 @@ function checkCycle(clen) {
   let fp = '';
   for (let i = 0; i < clen; i++) fp += COLOR_CHAR[src[(off + i) % clen]];
 
-  // Rule B: dihedral duplicate
   if (fpSet.has(fp)) return '';
 
-  // Rule C: even-length + mirror-symmetric
   if (clen % 2 === 0) {
     let mirror = true;
     for (let k = 0; k < clen; k++) {
@@ -131,7 +123,6 @@ function checkCycle(clen) {
   return fp;
 }
 
-// ── DFS: find all simple paths from `to` back to `from`, validate inline ──────
 function dfs(cur) {
   if (dfsBad || dfsCycCount >= CHECK_CAP) return;
   const base = cur * MAX_DEG;
@@ -164,7 +155,7 @@ function dfs(cur) {
   }
 }
 
-// ── LCG RNG (faster than Math.random() for tight loops) ──────────────────────
+// ── LCG RNG ───────────────────────────────────────────────────────────────────
 let seed = 0;
 function randInt(n) {
   seed = (Math.imul(seed, 1664525) + 1013904223) | 0;
@@ -183,19 +174,14 @@ function shuffle() {
   }
 }
 
-// Phase 1: random bipartite matching + Rule A color selection.
-// Phase 2: incremental cycle validation (Rule B + C).
-// Returns true if all N edges are valid (and committed to adj).
-// Returns false if any edge fails (adj restored to tree-only state).
 function tryOne() {
   shuffle();
 
   for (let i = 0; i < N; i++) {
     const topIdx = topFrontierIdx[i];
     const botIdx = botFrontierIdx[perm[i]];
-    const ft = parentColorI[topIdx]; // 255 = no constraint
+    const ft = parentColorI[topIdx];
     const fb = parentColorI[botIdx];
-    // Bitmask: remove forbidden colors, pick uniformly from valid set.
     let mask = 0b111;
     if (ft !== 255) mask &= ~(1 << ft);
     if (fb !== 255) mask &= ~(1 << fb);
@@ -241,7 +227,6 @@ function undoAll() {
   for (let i = N - 1; i >= 0; i--) adjRemoveI(pairsTop[i], pairsBot[i], pairsCol[i]);
 }
 
-// Canonical dedup key for solutions (order-independent sorted string).
 function solutionKey() {
   const parts = new Array(N);
   for (let i = 0; i < N; i++) {
@@ -251,30 +236,24 @@ function solutionKey() {
 }
 
 // ── Search state ──────────────────────────────────────────────────────────────
-let stopped   = false;
 let attempts  = 0;
 let validFound = 0;
 let seenKeys;
 let gen = 0;
 let startTime        = 0;
 let lastProgressTime = 0;
-let batchCount       = 0;
 let nextCheckpoint   = CHECKPOINT_INTERVAL;
 
-// ── Batch runner ──────────────────────────────────────────────────────────────
-function runBatch() {
-  if (stopped) {
-    parentPort.postMessage({ type: 'STOPPED', attempts, validFound });
-    return;
-  }
+// ── Tight search loop — no event-loop yield ───────────────────────────────────
+// Runs synchronously forever until stopFlag[0] becomes non-zero.
+// Progress/checkpoint/solution messages are sent inline (non-blocking in worker_threads).
+function runSearch() {
+  while (true) {
+    // Inner block: INNER_N attempts between stop-flag checks and time reads.
+    const blockStart      = performance.now();
+    const blockStartAtpts = attempts;
 
-  const batchStart      = performance.now();
-  const batchStartAtpts = attempts;
-
-  outer:
-  while (performance.now() - batchStart < BATCH_MS) {
     for (let i = 0; i < INNER_N; i++) {
-      if (stopped) break outer;
       attempts++;
 
       if (attempts === nextCheckpoint) {
@@ -300,64 +279,59 @@ function runBatch() {
           type: 'SOLUTION',
           key,
           solution: {
-            id:          `rand-${Date.now()}-${validFound}`,
-            generation:  gen,
+            id:         `rand-${Date.now()}-${validFound}`,
+            generation: gen,
             connections,
-            timestamp:   Date.now(),
+            timestamp:  Date.now(),
           },
         });
       }
 
       undoAll();
     }
+
+    // ── Check stop flag (written by parent via Atomics.store) ─────────────────
+    if (Atomics.load(stopFlag, 0) !== 0) {
+      parentPort.postMessage({ type: 'STOPPED', attempts, validFound });
+      return;
+    }
+
+    // ── Progress update ───────────────────────────────────────────────────────
+    const now     = performance.now();
+    const elapsed = (now - startTime) / 1000;
+    if (now - lastProgressTime >= PROGRESS_MS) {
+      lastProgressTime = now;
+      const blockElap  = (now - blockStart) / 1000;
+      const blockDelta = attempts - blockStartAtpts;
+      parentPort.postMessage({
+        type:                    'PROGRESS',
+        attempts,
+        validFound,
+        attemptsPerSecCurrent:   blockElap > 0 ? Math.round(blockDelta / blockElap) : 0,
+        attemptsPerSecAvg:       elapsed   > 0.5 ? Math.round(attempts / elapsed)   : 0,
+        uptime:                  elapsed,
+      });
+    }
   }
-
-  batchCount++;
-  const now       = performance.now();
-  const elapsed   = (now - startTime) / 1000;
-  const batchElap = (now - batchStart) / 1000;
-  const batchDelta = attempts - batchStartAtpts;
-
-  if (now - lastProgressTime >= PROGRESS_MS) {
-    lastProgressTime = now;
-    parentPort.postMessage({
-      type:                    'PROGRESS',
-      attempts,
-      validFound,
-      attemptsPerSecCurrent:   batchElap > 0 ? Math.round(batchDelta / batchElap) : 0,
-      attemptsPerSecAvg:       elapsed   > 0.5 ? Math.round(attempts / elapsed) : 0,
-      uptime:                  elapsed,
-    });
-  }
-
-  setImmediate(runBatch); // yield to event loop so STOP message can be processed
 }
 
 // ── Worker entry point ────────────────────────────────────────────────────────
 parentPort.on('message', (msg) => {
-  if (msg.type === 'STOP') {
-    stopped = true;
-    return;
-  }
-
   if (msg.type !== 'START') return;
 
   const { gen: g, baseAttempts = 0 } = msg;
 
   gen            = g;
-  stopped        = false;
   attempts       = 0;
   validFound     = 0;
   seenKeys       = new Set();
   startTime      = performance.now();
   lastProgressTime = 0;
-  batchCount     = 0;
-  // Align checkpoint to the next 20 M boundary above baseAttempts.
   nextCheckpoint = (Math.floor(baseAttempts / CHECKPOINT_INTERVAL) + 1) * CHECKPOINT_INTERVAL - baseAttempts;
   if (nextCheckpoint <= 0) nextCheckpoint = CHECKPOINT_INTERVAL;
   seed = (Date.now() ^ (Math.random() * 0x80000000 | 0)) | 0;
 
-  // ── Build graph from gen number ──────────────────────────────────────────
+  // Build graphs from gen number.
   const topGraph    = generateGraph(gen, 'top');
   const bottomGraph = generateGraph(gen, 'bot');
 
@@ -370,35 +344,24 @@ parentPort.on('message', (msg) => {
   }
   const nodeCount = nodeIdxToId.length;
 
-  // parentColorI: Rule A constraint per frontier node (255 = no constraint).
   parentColorI = new Uint8Array(nodeCount).fill(255);
   const colorToInt = { red: 0, green: 1, blue: 2 };
 
   for (const e of topGraph.edges) {
     const tid = idToIdx.get(e.targetId);
-    if (tid !== undefined) {
-      const node = topGraph.nodes.find(n => n.id === e.targetId);
-      if (node && node.isFrontier) parentColorI[tid] = colorToInt[e.color];
-    }
+    const node = topGraph.nodes.find(n => n.id === e.targetId);
+    if (tid !== undefined && node && node.isFrontier) parentColorI[tid] = colorToInt[e.color];
   }
   for (const e of bottomGraph.edges) {
     const tid = idToIdx.get(e.targetId);
-    if (tid !== undefined) {
-      const node = bottomGraph.nodes.find(n => n.id === e.targetId);
-      if (node && node.isFrontier) parentColorI[tid] = colorToInt[e.color];
-    }
+    const node = bottomGraph.nodes.find(n => n.id === e.targetId);
+    if (tid !== undefined && node && node.isFrontier) parentColorI[tid] = colorToInt[e.color];
   }
 
-  // Build adjacency from tree edges only.
   adjDeg.fill(0, 0, nodeCount);
-  for (const e of topGraph.edges) {
-    adjAddI(idToIdx.get(e.sourceId), idToIdx.get(e.targetId), colorToInt[e.color]);
-  }
-  for (const e of bottomGraph.edges) {
-    adjAddI(idToIdx.get(e.sourceId), idToIdx.get(e.targetId), colorToInt[e.color]);
-  }
+  for (const e of topGraph.edges)    adjAddI(idToIdx.get(e.sourceId), idToIdx.get(e.targetId), colorToInt[e.color]);
+  for (const e of bottomGraph.edges) adjAddI(idToIdx.get(e.sourceId), idToIdx.get(e.targetId), colorToInt[e.color]);
 
-  // Frontier index arrays.
   const topFront = topGraph.nodes.filter(n => n.isFrontier);
   const botFront = bottomGraph.nodes.filter(n => n.isFrontier);
   N = topFront.length;
@@ -420,5 +383,5 @@ parentPort.on('message', (msg) => {
   fpsBuf   = Array.from({ length: N }, () => []);
   fpSet    = new Set();
 
-  setImmediate(runBatch);
+  runSearch(); // synchronous — runs until stopFlag is set
 });
