@@ -1,0 +1,13 @@
+{
+  "name": "graph-local-search",
+  "version": "1.0.0",
+  "description": "Local random search runner — runs on your computer, saves solutions as JSON for import into the UI",
+  "main": "search.js",
+  "scripts": {
+    "random-search": "node search.js --gen 2",
+    "resume-search": "node search.js --gen 2 --resume"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

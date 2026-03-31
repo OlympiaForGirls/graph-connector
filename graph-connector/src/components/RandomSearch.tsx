@@ -1,13 +1,12 @@
 // RandomSearch.tsx — Monte Carlo random graph search UI.
 //
-// Supports two modes:
-//   LOCAL  (default)  — runs search in a browser Web Worker.
-//   BACKEND           — delegates to the Express backend API.
-//                       Activated by setting VITE_BACKEND_URL in the build env.
+// Runs the search in a browser Web Worker (local, no backend needed).
+// Found solutions can be exported as JSON or imported from a JSON file
+// produced by the local Node runner (local-search/search.js).
 //
-// The local mode is unchanged from the original implementation.
-// The backend mode polls /random-search-status every 3 s and
-// fetches /random-search-solutions whenever validFound increases.
+// Continuously generates random perfect matchings with random colors,
+// validates each one, and emits valid solutions until stopped.
+// Progress is checkpointed to localStorage every 20,000,000 attempts.
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Graph } from '../types/graph';
@@ -15,23 +14,6 @@ import type { ConnectionSnapshot, SolutionSnapshot } from '../types/solution';
 import { appendSolutions } from '../storage/solutions';
 import { EDGE_COLORS } from './GraphView';
 
-// ── Backend config ────────────────────────────────────────────────────────────
-const BACKEND_URL = (
-  (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? ''
-).replace(/\/$/, '');
-const USE_BACKEND = BACKEND_URL.length > 0;
-
-interface BackendStatus {
-  running:               boolean;
-  gen:                   number | null;
-  attempts:              number;
-  validFound:            number;
-  attemptsPerSecCurrent: number;
-  attemptsPerSecAvg:     number;
-  uptime:                number;
-}
-
-// ── Props ─────────────────────────────────────────────────────────────────────
 interface Props {
   gen:            number;
   topGraph:       Graph;
@@ -49,7 +31,7 @@ interface RandomStats {
   avgBatchSize:          number;
 }
 
-// ── localStorage checkpoint helpers (local mode only) ─────────────────────────
+// ── localStorage checkpoint helpers ──────────────────────────────────────────
 interface CheckpointData {
   attempts:   number;
   validFound: number;
@@ -73,7 +55,6 @@ function clearCheckpoint(gen: number): void {
   try { localStorage.removeItem(ckptKey(gen)); } catch { /* ignore */ }
 }
 
-// ── Formatters ────────────────────────────────────────────────────────────────
 function formatCount(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}k`;
@@ -93,47 +74,33 @@ function formatUptime(sec: number): string {
   return `${m}m ${s}s`;
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
 export default function RandomSearch({
   gen, topGraph, bottomGraph, onLoadSolution,
 }: Props) {
-  const [running,      setRunning]      = useState(false);
-  const [solutions,    setSolutions]    = useState<SolutionSnapshot[]>([]);
-  const [stats,        setStats]        = useState<RandomStats | null>(null);
-  const [stopped,      setStopped]      = useState(false);
-  const [lastCkpt,     setLastCkpt]     = useState<CheckpointData | null>(null);
-  const [backendError, setBackendError] = useState<string | null>(null);
+  const [running,   setRunning]   = useState(false);
+  const [solutions, setSolutions] = useState<SolutionSnapshot[]>([]);
+  const [stats,     setStats]     = useState<RandomStats | null>(null);
+  const [stopped,   setStopped]   = useState(false);
+  const [lastCkpt,  setLastCkpt]  = useState<CheckpointData | null>(null);
+  const [importErr, setImportErr] = useState<string | null>(null);
 
-  // Local worker refs (used only when !USE_BACKEND)
   const workerRef      = useRef<Worker | null>(null);
   const baseAttempts   = useRef(0);
   const baseValidFound = useRef(0);
-
-  // Backend mode refs
-  const knownSolCountRef  = useRef(0);
-  const sessionStartedRef = useRef(false); // true once user clicked Start this session
+  const importRef      = useRef<HTMLInputElement>(null);
 
   // Terminate worker on unmount.
   useEffect(() => () => { workerRef.current?.terminate(); }, []);
 
-  // ── Gen-change effect ─────────────────────────────────────────────────────
+  // Restore checkpoint and reset when gen changes.
   useEffect(() => {
     workerRef.current?.terminate();
     workerRef.current = null;
     setRunning(false);
     setSolutions([]);
     setStopped(false);
-    setBackendError(null);
-    sessionStartedRef.current = false;
-    knownSolCountRef.current  = 0;
+    setImportErr(null);
 
-    if (USE_BACKEND) {
-      setStats(null);
-      setLastCkpt(null);
-      return;
-    }
-
-    // Local mode: restore localStorage checkpoint.
     const ckpt = loadCheckpoint(gen);
     baseAttempts.current   = ckpt?.attempts   ?? 0;
     baseValidFound.current = ckpt?.validFound ?? 0;
@@ -145,88 +112,7 @@ export default function RandomSearch({
     } : null);
   }, [gen]);
 
-  // ── Backend polling effect (only when USE_BACKEND) ────────────────────────
-  useEffect(() => {
-    if (!USE_BACKEND) return;
-
-    let cancelled = false;
-
-    const poll = async () => {
-      if (cancelled) return;
-      try {
-        const res = await fetch(`${BACKEND_URL}/random-search-status`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data: BackendStatus = await res.json();
-
-        if (cancelled) return;
-
-        // Ignore data from a different gen.
-        if (data.gen !== null && data.gen !== gen) return;
-
-        setRunning(data.running);
-
-        // Mark stopped only if the user had started this session and search ended.
-        if (!data.running && sessionStartedRef.current && data.attempts > 0) {
-          setStopped(true);
-          sessionStartedRef.current = false;
-        }
-
-        if (data.attempts > 0 || data.running) {
-          setStats({
-            attempts:              data.attempts,
-            validFound:            data.validFound,
-            attemptsPerSecCurrent: data.attemptsPerSecCurrent,
-            attemptsPerSecAvg:     data.attemptsPerSecAvg,
-            uptime:                data.uptime,
-            uiUpdates:             0,
-            avgBatchSize:          0,
-          });
-        }
-
-        // Fetch solutions only when the count grew.
-        if (data.validFound > knownSolCountRef.current) {
-          knownSolCountRef.current = data.validFound;
-          const solRes = await fetch(`${BACKEND_URL}/random-search-solutions`);
-          if (solRes.ok) {
-            const solData: { solutions: SolutionSnapshot[] } = await solRes.json();
-            setSolutions(solData.solutions.filter(s => s.generation === gen));
-          }
-        }
-
-        setBackendError(null);
-      } catch {
-        if (!cancelled) setBackendError('Cannot reach backend. Check VITE_BACKEND_URL.');
-      }
-    };
-
-    poll();
-    const id = setInterval(poll, 3000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [gen]);
-
-  // ── Start handler ─────────────────────────────────────────────────────────
   const handleStart = useCallback(() => {
-    if (USE_BACKEND) {
-      setBackendError(null);
-      sessionStartedRef.current = true;
-      setStopped(false);
-      fetch(`${BACKEND_URL}/start-random-search`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ gen }),
-      })
-        .then(r => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          setRunning(true);
-        })
-        .catch(() => {
-          sessionStartedRef.current = false;
-          setBackendError('Failed to start. Is the backend deployed and running?');
-        });
-      return;
-    }
-
-    // ── Local worker start (unchanged) ──────────────────────────────────────
     workerRef.current?.terminate();
     setSolutions([]);
     setRunning(true);
@@ -284,31 +170,11 @@ export default function RandomSearch({
     worker.postMessage({ type: 'START', payload: { gen, topGraph, bottomGraph, baseAttempts: base } });
   }, [gen, topGraph, bottomGraph]);
 
-  // ── Stop handler ──────────────────────────────────────────────────────────
   const handleStop = useCallback(() => {
-    if (USE_BACKEND) {
-      fetch(`${BACKEND_URL}/stop-random-search`, { method: 'POST' })
-        .catch(() => setBackendError('Failed to stop.'));
-      return;
-    }
     workerRef.current?.postMessage({ type: 'STOP' });
   }, []);
 
-  // ── Clear handler ─────────────────────────────────────────────────────────
   const handleClear = useCallback(() => {
-    if (USE_BACKEND) {
-      fetch(`${BACKEND_URL}/reset-random-search`, { method: 'POST' })
-        .then(() => {
-          setSolutions([]);
-          setStats(null);
-          setStopped(false);
-          setBackendError(null);
-          knownSolCountRef.current  = 0;
-          sessionStartedRef.current = false;
-        })
-        .catch(() => setBackendError('Failed to reset backend.'));
-      return;
-    }
     clearCheckpoint(gen);
     baseAttempts.current   = 0;
     baseValidFound.current = 0;
@@ -318,18 +184,59 @@ export default function RandomSearch({
     setLastCkpt(null);
   }, [gen]);
 
+  // Export currently displayed solutions as JSON.
+  const handleExport = useCallback(() => {
+    if (solutions.length === 0) return;
+    const blob = new Blob([JSON.stringify(solutions, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `solutions-gen${gen}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [solutions, gen]);
+
+  // Import solutions from a JSON file (produced by local-search/search.js or exported earlier).
+  const handleImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportErr(null);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const raw = JSON.parse(ev.target?.result as string) as SolutionSnapshot[];
+        if (!Array.isArray(raw)) throw new Error('Expected a JSON array.');
+        const filtered = raw.filter(s =>
+          s && typeof s.generation === 'number' && Array.isArray(s.connections)
+        );
+        const forThisGen = filtered.filter(s => s.generation === gen);
+        if (filtered.length > 0 && forThisGen.length === 0) {
+          setImportErr(`File has ${filtered.length} solution(s) but none for gen ${gen}.`);
+          return;
+        }
+        appendSolutions(forThisGen);
+        setSolutions(prev => {
+          const existingIds = new Set(prev.map(s => s.id));
+          const newOnes = forThisGen.filter(s => !existingIds.has(s.id));
+          return [...prev, ...newOnes];
+        });
+        if (forThisGen.length === 0) {
+          setImportErr('No valid solutions found in the file.');
+        }
+      } catch {
+        setImportErr('Import failed: file must be a valid solutions JSON array.');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  }, [gen]);
+
   const hitRate = (stats && stats.attempts > 0)
     ? ((stats.validFound / stats.attempts) * 100).toFixed(3)
     : null;
 
   return (
     <div className="random-panel">
-      {USE_BACKEND && (
-        <p className="random-checkpoint" style={{ color: '#9999cc' }}>
-          Mode: <strong>Backend</strong> — {BACKEND_URL}
-        </p>
-      )}
-
       <div className="random-controls">
         {!running ? (
           <button className="random-start-btn" onClick={handleStart}>
@@ -347,17 +254,37 @@ export default function RandomSearch({
         >
           Clear
         </button>
+        <button
+          className="search-export-btn"
+          onClick={handleExport}
+          disabled={solutions.length === 0}
+          title="Save found solutions as a JSON file"
+        >
+          Export JSON
+        </button>
+        <button
+          className="search-import-btn"
+          onClick={() => importRef.current?.click()}
+          disabled={running}
+          title="Import solutions found by local-search/search.js"
+        >
+          Import JSON
+        </button>
+        <input
+          ref={importRef}
+          type="file"
+          accept=".json"
+          style={{ display: 'none' }}
+          onChange={handleImport}
+        />
       </div>
 
-      {backendError && (
-        <p className="random-stopped" style={{ color: '#e84040' }}>
-          {backendError}
-        </p>
+      {importErr && (
+        <p className="search-frontier-error">{importErr}</p>
       )}
 
       {stats && (
         <>
-          {/* Primary stats */}
           <div className="random-stats">
             <div className="random-stat">
               <span className="random-stat-label">Attempts</span>
@@ -383,44 +310,27 @@ export default function RandomSearch({
             )}
           </div>
 
-          {/* Diagnostics (local mode only — backend doesn't emit these) */}
-          {!USE_BACKEND && (
-            <div className="random-diag">
-              <span className="random-diag-title">Diagnostics</span>
-              <div className="random-stats random-stats--diag">
-                <div className="random-stat random-stat--sm">
-                  <span className="random-stat-label">Uptime</span>
-                  <span className="random-stat-value random-stat-value--dim">{formatUptime(stats.uptime)}</span>
-                </div>
-                <div className="random-stat random-stat--sm">
-                  <span className="random-stat-label">UI updates</span>
-                  <span className="random-stat-value random-stat-value--dim">{stats.uiUpdates}</span>
-                </div>
-                <div className="random-stat random-stat--sm">
-                  <span className="random-stat-label">Avg batch</span>
-                  <span className="random-stat-value random-stat-value--dim">{formatCount(stats.avgBatchSize)}</span>
-                </div>
+          <div className="random-diag">
+            <span className="random-diag-title">Diagnostics</span>
+            <div className="random-stats random-stats--diag">
+              <div className="random-stat random-stat--sm">
+                <span className="random-stat-label">Uptime</span>
+                <span className="random-stat-value random-stat-value--dim">{formatUptime(stats.uptime)}</span>
+              </div>
+              <div className="random-stat random-stat--sm">
+                <span className="random-stat-label">UI updates</span>
+                <span className="random-stat-value random-stat-value--dim">{stats.uiUpdates}</span>
+              </div>
+              <div className="random-stat random-stat--sm">
+                <span className="random-stat-label">Avg batch</span>
+                <span className="random-stat-value random-stat-value--dim">{formatCount(stats.avgBatchSize)}</span>
               </div>
             </div>
-          )}
-
-          {/* Uptime in backend mode */}
-          {USE_BACKEND && stats.uptime > 0 && (
-            <div className="random-diag">
-              <span className="random-diag-title">Diagnostics</span>
-              <div className="random-stats random-stats--diag">
-                <div className="random-stat random-stat--sm">
-                  <span className="random-stat-label">Uptime</span>
-                  <span className="random-stat-value random-stat-value--dim">{formatUptime(stats.uptime)}</span>
-                </div>
-              </div>
-            </div>
-          )}
+          </div>
         </>
       )}
 
-      {/* Checkpoint display (local mode only) */}
-      {!USE_BACKEND && lastCkpt && (
+      {lastCkpt && (
         <p className="random-checkpoint">
           Last checkpoint: {formatCount(lastCkpt.attempts)} attempts
           {' · '}{new Date(lastCkpt.timestamp).toLocaleTimeString()}
@@ -433,10 +343,10 @@ export default function RandomSearch({
         </p>
       )}
 
-      {!stats && !running && !backendError && (
+      {!stats && !running && (
         <p className="random-starting">
-          Press <em>Start Random Search</em> to begin sampling random configurations.
-          {USE_BACKEND && ' (runs on server)'}
+          Press <em>Start Random Search</em> to run in the browser,
+          or <em>Import JSON</em> to load solutions found by the local Node runner.
         </p>
       )}
 
