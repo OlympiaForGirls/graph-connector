@@ -242,9 +242,7 @@ export default function RandomSearch({ gen, topGraph, bottomGraph, onLoadSolutio
       {activeTab === 'browser' && (
         <div>
           <p className="random-starting" style={{ marginTop: 0, marginBottom: '10px' }}>
-            Runs directly in your browser using a Web Worker.
-            Convenient for quick exploration — typically <strong>40–80k/s</strong>.
-            For long heavy runs use the local Node runner and import here.
+            Web Worker.
           </p>
 
           <div className="random-controls">
