@@ -16,6 +16,7 @@ import DebugValidation from './components/DebugValidation';
 import AuditMode from './components/AuditMode';
 import RandomSearch from './components/RandomSearch';
 import { generateGraph, computeSvgDimensions, LEVEL_HEIGHT } from './generation/graphGenerator';
+import type { GraphTemplate } from './generation/graphGenerator';
 import { useGraphInteraction } from './hooks/useGraphInteraction';
 import { validateMove } from './validation/validateMove';
 import type { ValidationResult } from './validation/validateMove';
@@ -171,6 +172,7 @@ function CycleAnalysisRow({ a }: { a: CycleAnalysis }) {
 
 // ── App ────────────────────────────────────────────────────────────────────
 export default function App() {
+  const [template, setTemplate]     = useState<GraphTemplate>('3branch');
   const [gen, setGen]               = useState(2);
   const [mode, setMode]             = useState<'manual' | 'search' | 'partial' | 'complete' | 'audit' | 'random'>('manual');
   const [validation, setValidation] = useState<ValidationResult | null>(null);
@@ -186,23 +188,23 @@ export default function App() {
     clearSelection, reset, applySolution, createEdge,
   } = useGraphInteraction();
 
-  // Regenerate both graphs whenever gen changes.
+  // Regenerate both graphs whenever gen or template changes.
   const { topGraph, bottomGraph, dims } = useMemo(() => {
-    const dims = computeSvgDimensions(gen);
+    const dims = computeSvgDimensions(gen, template);
     const topGraph = generateGraph(gen, {
       graphId: 'top',
       rootX: dims.centerX,
       rootY: dims.topRootY,
       levelHeight: LEVEL_HEIGHT,
-    });
+    }, template);
     const bottomGraph = generateGraph(gen, {
       graphId: 'bot',
       rootX: dims.centerX,
       rootY: dims.botRootY,
-      levelHeight: -LEVEL_HEIGHT,   // grows upward
-    });
+      levelHeight: -LEVEL_HEIGHT,
+    }, template);
     return { topGraph, bottomGraph, dims };
-  }, [gen]);
+  }, [gen, template]);
 
   // r/g/b keyboard shortcuts for colour selection in Manual Mode.
   useEffect(() => {
@@ -217,12 +219,12 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [mode, setColor]);
 
-  // Reset all connections when gen changes (old node IDs are no longer valid).
+  // Reset all connections when gen or template changes (node IDs are no longer valid).
   useEffect(() => {
     reset();
     setValidation(null);
     setRejection(null);
-  }, [gen]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [gen, template]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Absolute position maps — used by CrossEdgeLayer.
   const topPos    = useMemo(
@@ -323,10 +325,28 @@ export default function App() {
 
   const { svgW, svgH, topRootY, botRootY } = dims;
 
+  const templateLabel = template === '3branch' ? '3-Branch Graph' : '2-Branch Tree';
+
   return (
     <div className="app">
+      {/* ── Top-level template selector ─────────────────────────────────── */}
+      <div className="template-tabs">
+        <button
+          className={`template-tab${template === '3branch' ? ' template-tab--active' : ''}`}
+          onClick={() => setTemplate('3branch')}
+        >
+          3-Branch Graph
+        </button>
+        <button
+          className={`template-tab${template === '2branch' ? ' template-tab--active' : ''}`}
+          onClick={() => setTemplate('2branch')}
+        >
+          2-Branch Tree
+        </button>
+      </div>
+
       <header className="app-header">
-        <h1>3-Regular Graph Connection</h1>
+        <h1>{templateLabel}</h1>
         <p className="subtitle"></p>
       </header>
 
