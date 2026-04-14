@@ -28,15 +28,19 @@
 import type { Graph, GraphNode, GraphEdge, EdgeColor } from '../types/graph';
 
 // ── Graph template ────────────────────────────────────────────────────────────
-export type GraphTemplate = '3branch' | '2branch';
+// '3branch' | '2branch' — two-tree mode (top + bottom graph face each other).
+// 'solo'                — single-tree mode (one binary tree, frontier self-connects).
+export type GraphTemplate = '3branch' | '2branch' | 'solo';
 
 // ── Layout constants (exported for App.tsx layout math) ───────────────────────
-export const NODE_SPACING = 80;
-export const LEVEL_HEIGHT = 75;
-export const CONNECTOR_H  = 80;
-export const NODE_RADIUS  = 14;
-export const MAX_GEN      = 10;
-export const MIN_GEN      = 1;
+export const NODE_SPACING   = 80;
+export const LEVEL_HEIGHT   = 75;
+export const CONNECTOR_H    = 80;
+/** Vertical gap between solo-tree frontier and the shadow soloB frontier (0 = same row). */
+const SOLO_CONNECTOR = 0;
+export const NODE_RADIUS    = 14;
+export const MAX_GEN        = 10;
+export const MIN_GEN        = 1;
 
 const PAD_X   = 40;
 const PAD_TOP = 44;
@@ -47,7 +51,7 @@ const MIN_W   = 420;
 
 function nodesAtLevel(level: number, template: GraphTemplate): number {
   if (level === 0) return 1;
-  if (template === '2branch') return Math.pow(2, level);
+  if (template === '2branch' || template === 'solo') return Math.pow(2, level);
   if (level === 1) return 3;
   return 3 * Math.pow(2, level - 1);
 }
@@ -57,7 +61,7 @@ export function frontierCount(gen: number, template: GraphTemplate = '3branch'):
 }
 
 export function totalNodeCount(gen: number, template: GraphTemplate = '3branch'): number {
-  if (template === '2branch') return Math.pow(2, gen + 1) - 1;
+  if (template === '2branch' || template === 'solo') return Math.pow(2, gen + 1) - 1;
   return 3 * Math.pow(2, gen) - 2;
 }
 
@@ -81,6 +85,17 @@ export function computeSvgDimensions(gen: number, template: GraphTemplate = '3br
 
   const topRootY     = PAD_TOP;
   const topFrontierY = PAD_TOP + gen * LEVEL_HEIGHT;
+
+  if (template === 'solo') {
+    // Single-tree layout: soloB shadow tree placed SOLO_CONNECTOR below solo frontier.
+    // soloB root is at topRootY + SOLO_CONNECTOR so that soloB frontier lands at
+    // topFrontierY + SOLO_CONNECTOR (= botFrontierY).
+    const botFrontierY = topFrontierY + SOLO_CONNECTOR;
+    const botRootY     = topRootY + SOLO_CONNECTOR;  // soloB root (not rendered)
+    const svgH         = botFrontierY + PAD_BOT;
+    return { svgW, svgH, centerX, topRootY, topFrontierY, botFrontierY, botRootY };
+  }
+
   const botFrontierY = topFrontierY + CONNECTOR_H;
   const botRootY     = botFrontierY + gen * LEVEL_HEIGHT;
   const svgH         = botRootY + PAD_BOT;
@@ -91,7 +106,7 @@ export function computeSvgDimensions(gen: number, template: GraphTemplate = '3br
 // ── Graph generation ──────────────────────────────────────────────────────────
 
 export interface LayoutOptions {
-  graphId: 'top' | 'bot';
+  graphId: 'top' | 'bot' | 'solo' | 'soloB';
   rootX: number;
   rootY: number;
   levelHeight: number;
@@ -104,7 +119,10 @@ export function generateGraph(
 ): Graph {
   const { graphId, rootX, rootY, levelHeight } = opts;
 
-  const fc        = frontierCount(gen, template);
+  // 'solo' uses the same binary-tree structure as '2branch'.
+  const tpl: '2branch' | '3branch' = template === 'solo' ? '2branch' : template;
+
+  const fc        = frontierCount(gen, tpl);
   const totalSpan = fc * NODE_SPACING;
   const leftEdge  = rootX - totalSpan / 2;
 
@@ -114,12 +132,12 @@ export function generateGraph(
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
 
-  // Root children colors depend on the template.
+  // Root children colors depend on the effective template.
   const rootChildColors: EdgeColor[] =
-    template === '2branch' ? ['blue', 'green'] : ['blue', 'green', 'red'];
+    tpl === '2branch' ? ['blue', 'green'] : ['blue', 'green', 'red'];
 
   for (let level = 0; level <= gen; level++) {
-    const count      = nodesAtLevel(level, template);
+    const count      = nodesAtLevel(level, tpl);
     const subWidth   = totalSpan / count;
     const isFrontier = level === gen;
 

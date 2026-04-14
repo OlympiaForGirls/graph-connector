@@ -189,8 +189,25 @@ export default function App() {
   } = useGraphInteraction();
 
   // Regenerate both graphs whenever gen or template changes.
+  // In 'solo' mode, soloB is an invisible twin of soloA at the same positions,
+  // used only by the solver; only soloA is rendered.
   const { topGraph, bottomGraph, dims } = useMemo(() => {
     const dims = computeSvgDimensions(gen, template);
+    if (template === 'solo') {
+      const soloA = generateGraph(gen, {
+        graphId: 'solo',
+        rootX: dims.centerX,
+        rootY: dims.topRootY,
+        levelHeight: LEVEL_HEIGHT,
+      }, 'solo');
+      const soloB = generateGraph(gen, {
+        graphId: 'soloB',
+        rootX: dims.centerX,
+        rootY: dims.topRootY,   // same rootY → same positions as soloA
+        levelHeight: LEVEL_HEIGHT,
+      }, 'solo');
+      return { topGraph: soloA, bottomGraph: soloB, dims };
+    }
     const topGraph = generateGraph(gen, {
       graphId: 'top',
       rootX: dims.centerX,
@@ -263,19 +280,34 @@ export default function App() {
       return;
     }
 
+    // In solo mode both clicks are on soloA nodes; remap the second to soloB.
+    const effectiveBottomId = isSolo
+      ? nodeId.replace(/^solo-/, 'soloB-')
+      : nodeId;
+
+    // Prevent self-pairing in solo mode (same frontier position).
+    if (isSolo && effectiveBottomId === selectedNode.nodeId.replace(/^solo-/, 'soloB-') &&
+        selectedNode.nodeId === nodeId) {
+      clearSelection();
+      setValidation(null);
+      setRejection(null);
+      return;
+    }
+
     // Two distinct frontier nodes selected — validate then create.
     const result = validateMove(topGraph, bottomGraph, crossEdges, {
       topNodeId:    selectedNode.nodeId,
-      bottomNodeId: nodeId,
+      bottomNodeId: effectiveBottomId,
       color:        pendingColor,
     });
     setValidation(result);
     if (result.allowed) {
-      createEdge(selectedNode.nodeId, nodeId, pendingColor);
+      createEdge(selectedNode.nodeId, effectiveBottomId, pendingColor);
       setRejection(null);
     } else {
       const fromPos = topPos[selectedNode.nodeId] ?? bottomPos[selectedNode.nodeId];
-      const toPos   = topPos[nodeId] ?? bottomPos[nodeId];
+      // For solo mode, visual position of the second node is in topPos.
+      const toPos   = topPos[nodeId] ?? bottomPos[nodeId] ?? topPos[effectiveBottomId] ?? bottomPos[effectiveBottomId];
       if (fromPos && toPos) {
         setRejection({
           x1: fromPos.x, y1: fromPos.y,
@@ -325,7 +357,12 @@ export default function App() {
 
   const { svgW, svgH, topRootY, botRootY } = dims;
 
-  const templateLabel = template === '3branch' ? '3-Branch Graph' : '2-Branch Tree';
+  const templateLabel =
+    template === '3branch' ? '3-Branch Graph' :
+    template === '2branch' ? '2-Branch Tree'  :
+    'Single Tree';
+
+  const isSolo = template === 'solo';
 
   return (
     <div className="app">
@@ -342,6 +379,12 @@ export default function App() {
           onClick={() => setTemplate('2branch')}
         >
           2-Branch Tree
+        </button>
+        <button
+          className={`template-tab${template === 'solo' ? ' template-tab--active' : ''}`}
+          onClick={() => setTemplate('solo')}
+        >
+          Single Tree
         </button>
       </div>
 
@@ -363,18 +406,29 @@ export default function App() {
           className="graph-canvas"
         >
           {/* Graph labels */}
-          <text
-            x={svgW / 2} y={topRootY - 18}
-            textAnchor="middle" fontSize={11} fontWeight={700}
-            fill="#9999cc" letterSpacing={1.5}
-            style={{ userSelect: 'none' }}
-          >TOP GRAPH</text>
-          <text
-            x={svgW / 2} y={botRootY + 28}
-            textAnchor="middle" fontSize={11} fontWeight={700}
-            fill="#9999cc" letterSpacing={1.5}
-            style={{ userSelect: 'none' }}
-          >BOTTOM GRAPH</text>
+          {isSolo ? (
+            <text
+              x={svgW / 2} y={topRootY - 18}
+              textAnchor="middle" fontSize={11} fontWeight={700}
+              fill="#9999cc" letterSpacing={1.5}
+              style={{ userSelect: 'none' }}
+            >SINGLE TREE</text>
+          ) : (
+            <>
+              <text
+                x={svgW / 2} y={topRootY - 18}
+                textAnchor="middle" fontSize={11} fontWeight={700}
+                fill="#9999cc" letterSpacing={1.5}
+                style={{ userSelect: 'none' }}
+              >TOP GRAPH</text>
+              <text
+                x={svgW / 2} y={botRootY + 28}
+                textAnchor="middle" fontSize={11} fontWeight={700}
+                fill="#9999cc" letterSpacing={1.5}
+                style={{ userSelect: 'none' }}
+              >BOTTOM GRAPH</text>
+            </>
+          )}
 
           {/* Cycle glow and ghost edge — behind cross edges and nodes */}
           <CrossEdgeGlowLayer
@@ -394,18 +448,25 @@ export default function App() {
 
           <GraphView
             graph={topGraph}
-            selectedNodeId={selectedNode?.graphId === 'top' ? selectedNode.nodeId : null}
+            selectedNodeId={
+              isSolo
+                ? (selectedNode?.nodeId ?? null)
+                : (selectedNode?.graphId === 'top' ? selectedNode.nodeId : null)
+            }
             onNodeClick={mode === 'manual' ? handleClick : () => {}}
             highlightNodeIds={rejection?.highlightNodeIds}
             highlightEdgeKeys={rejection?.highlightEdgeKeys}
           />
-          <GraphView
-            graph={bottomGraph}
-            selectedNodeId={selectedNode?.graphId === 'bot' ? selectedNode.nodeId : null}
-            onNodeClick={mode === 'manual' ? handleClick : () => {}}
-            highlightNodeIds={rejection?.highlightNodeIds}
-            highlightEdgeKeys={rejection?.highlightEdgeKeys}
-          />
+          {/* In solo mode we don't render the soloB shadow graph */}
+          {!isSolo && (
+            <GraphView
+              graph={bottomGraph}
+              selectedNodeId={selectedNode?.graphId === 'bot' ? selectedNode.nodeId : null}
+              onNodeClick={mode === 'manual' ? handleClick : () => {}}
+              highlightNodeIds={rejection?.highlightNodeIds}
+              highlightEdgeKeys={rejection?.highlightEdgeKeys}
+            />
+          )}
         </svg>
       </main>
 
