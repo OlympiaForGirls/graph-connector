@@ -30,7 +30,8 @@ import type { Graph, GraphNode, GraphEdge, EdgeColor } from '../types/graph';
 // ── Graph template ────────────────────────────────────────────────────────────
 // '3branch' | '2branch' — two-tree mode (top + bottom graph face each other).
 // 'solo'                — single-tree mode (one binary tree, frontier self-connects).
-export type GraphTemplate = '3branch' | '2branch' | 'solo';
+// 'asymmetric'          — like '2branch' but top root → [blue,green], bottom root → [red,blue].
+export type GraphTemplate = '3branch' | '2branch' | 'solo' | 'asymmetric';
 
 // ── Layout constants (exported for App.tsx layout math) ───────────────────────
 export const NODE_SPACING   = 80;
@@ -51,7 +52,7 @@ const MIN_W   = 420;
 
 function nodesAtLevel(level: number, template: GraphTemplate): number {
   if (level === 0) return 1;
-  if (template === '2branch' || template === 'solo') return Math.pow(2, level);
+  if (template === '2branch' || template === 'solo' || template === 'asymmetric') return Math.pow(2, level);
   if (level === 1) return 3;
   return 3 * Math.pow(2, level - 1);
 }
@@ -61,7 +62,7 @@ export function frontierCount(gen: number, template: GraphTemplate = '3branch'):
 }
 
 export function totalNodeCount(gen: number, template: GraphTemplate = '3branch'): number {
-  if (template === '2branch' || template === 'solo') return Math.pow(2, gen + 1) - 1;
+  if (template === '2branch' || template === 'solo' || template === 'asymmetric') return Math.pow(2, gen + 1) - 1;
   return 3 * Math.pow(2, gen) - 2;
 }
 
@@ -119,8 +120,9 @@ export function generateGraph(
 ): Graph {
   const { graphId, rootX, rootY, levelHeight } = opts;
 
-  // 'solo' uses the same binary-tree structure as '2branch'.
-  const tpl: '2branch' | '3branch' = template === 'solo' ? '2branch' : template;
+  // 'solo' and 'asymmetric' use the same binary-tree structure as '2branch'.
+  const tpl: '2branch' | '3branch' =
+    (template === 'solo' || template === 'asymmetric') ? '2branch' : template;
 
   const fc        = frontierCount(gen, tpl);
   const totalSpan = fc * NODE_SPACING;
@@ -133,8 +135,15 @@ export function generateGraph(
   const edges: GraphEdge[] = [];
 
   // Root children colors depend on the effective template.
-  const rootChildColors: EdgeColor[] =
-    tpl === '2branch' ? ['blue', 'green'] : ['blue', 'green', 'red'];
+  // 'asymmetric': top (graphId !== 'bot') → [blue, green]; bottom (graphId === 'bot') → [red, blue].
+  let rootChildColors: EdgeColor[];
+  if (tpl === '3branch') {
+    rootChildColors = ['blue', 'green', 'red'];
+  } else if (template === 'asymmetric' && graphId === 'bot') {
+    rootChildColors = ['red', 'blue'];
+  } else {
+    rootChildColors = ['blue', 'green'];
+  }
 
   for (let level = 0; level <= gen; level++) {
     const count      = nodesAtLevel(level, tpl);

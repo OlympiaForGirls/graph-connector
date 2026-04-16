@@ -358,8 +358,9 @@ export default function App() {
   const { svgW, svgH, topRootY, botRootY } = dims;
 
   const templateLabel =
-    template === '3branch' ? '3-Branch Graph' :
-    template === '2branch' ? '2-Branch Tree'  :
+    template === '3branch'    ? '3-Branch Graph'      :
+    template === '2branch'    ? '2-Branch Tree'       :
+    template === 'asymmetric' ? '2-Branch Tree (Alt)' :
     'Single Tree';
 
   const isSolo = template === 'solo';
@@ -379,6 +380,12 @@ export default function App() {
           onClick={() => setTemplate('2branch')}
         >
           2-Branch Tree
+        </button>
+        <button
+          className={`template-tab${template === 'asymmetric' ? ' template-tab--active' : ''}`}
+          onClick={() => setTemplate('asymmetric')}
+        >
+          2-Branch Tree (Alt)
         </button>
         <button
           className={`template-tab${template === 'solo' ? ' template-tab--active' : ''}`}
