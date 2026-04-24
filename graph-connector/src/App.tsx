@@ -15,6 +15,8 @@ import CompleteFromPartial from './components/CompleteFromPartial';
 import DebugValidation from './components/DebugValidation';
 import AuditMode from './components/AuditMode';
 import RandomSearch from './components/RandomSearch';
+import NCycleSearch from './components/NCycleSearch';
+import type { CycleHighlight } from './cycleOrderSearch/validateCycle';
 import { generateGraph, computeSvgDimensions, LEVEL_HEIGHT } from './generation/graphGenerator';
 import type { GraphTemplate } from './generation/graphGenerator';
 import { useGraphInteraction } from './hooks/useGraphInteraction';
@@ -114,6 +116,36 @@ function CrossEdgeGlowLayer({
   );
 }
 
+// ── CycleCrossEdgeGlowLayer ───────────────────────────────────────────────
+// Renders a teal glow behind cross-edges that are part of the loaded N-Cycle result.
+function CycleCrossEdgeGlowLayer({
+  crossEdges, topPos, bottomPos, cycleNodeIds,
+}: {
+  crossEdges:  CrossEdge[];
+  topPos:      Record<string, { x: number; y: number }>;
+  bottomPos:   Record<string, { x: number; y: number }>;
+  cycleNodeIds: ReadonlySet<string> | null;
+}) {
+  if (!cycleNodeIds || cycleNodeIds.size === 0) return null;
+  return (
+    <g>
+      {crossEdges.map(edge => {
+        if (!cycleNodeIds.has(edge.topNodeId) || !cycleNodeIds.has(edge.bottomNodeId)) return null;
+        const a = topPos[edge.topNodeId]    ?? bottomPos[edge.topNodeId];
+        const b = topPos[edge.bottomNodeId] ?? bottomPos[edge.bottomNodeId];
+        if (!a || !b) return null;
+        return (
+          <line
+            key={edge.id}
+            x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+            stroke="#00c8d8" strokeWidth={11} strokeLinecap="round" opacity={0.35}
+          />
+        );
+      })}
+    </g>
+  );
+}
+
 // ── GhostEdgeLayer ────────────────────────────────────────────────────────
 // Renders the rejected edge attempt as a dashed red line with an × mark.
 function GhostEdgeLayer({ overlay }: { overlay: RejectionOverlay | null }) {
@@ -174,13 +206,14 @@ function CycleAnalysisRow({ a }: { a: CycleAnalysis }) {
 export default function App() {
   const [template, setTemplate]     = useState<GraphTemplate>('3branch');
   const [gen, setGen]               = useState(2);
-  const [mode, setMode]             = useState<'manual' | 'search' | 'partial' | 'complete' | 'audit' | 'random'>('manual');
+  const [mode, setMode]             = useState<'manual' | 'search' | 'partial' | 'complete' | 'audit' | 'random' | 'ncycle'>('manual');
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [rejection, setRejection]   = useState<RejectionOverlay | null>(null);
   const [showCycles, setShowCycles] = useState(true);
   const [selectedPartial, setSelectedPartial] = useState<PartialPattern | null>(null);
   const [debugResult, setDebugResult] = useState<GraphValidationResult | null>(null);
   const [showDebug, setShowDebug] = useState(false);
+  const [cycleHighlight, setCycleHighlight] = useState<CycleHighlight | null>(null);
 
   const {
     selectedNode, crossEdges, pendingColor,
@@ -237,10 +270,13 @@ export default function App() {
   }, [mode, setColor]);
 
   // Reset all connections when gen or template changes (node IDs are no longer valid).
+  // If switching to solo (which hides the N-Cycle tab), also fall back to manual mode.
   useEffect(() => {
     reset();
     setValidation(null);
     setRejection(null);
+    setCycleHighlight(null);
+    if (template === 'solo') setMode(prev => prev === 'ncycle' ? 'manual' : prev);
   }, [gen, template]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Absolute position maps — used by CrossEdgeLayer.
@@ -303,6 +339,7 @@ export default function App() {
     setValidation(result);
     if (result.allowed) {
       createEdge(selectedNode.nodeId, effectiveBottomId, pendingColor);
+      setCycleHighlight(null);   // new manual edge supersedes cycle preview
       setRejection(null);
     } else {
       const fromPos = topPos[selectedNode.nodeId] ?? bottomPos[selectedNode.nodeId];
@@ -321,7 +358,7 @@ export default function App() {
   }, [selectedNode, crossEdges, pendingColor, topGraph, bottomGraph,
       allNodes, handleNodeClick, clearSelection, createEdge, topPos, bottomPos]);
 
-  const handleReset  = useCallback(() => { reset(); setValidation(null); setRejection(null); setDebugResult(null); }, [reset]);
+  const handleReset  = useCallback(() => { reset(); setValidation(null); setRejection(null); setDebugResult(null); setCycleHighlight(null); }, [reset]);
   const handleRemove = useCallback(
     (id: string) => { removeCrossEdge(id); setValidation(null); setRejection(null); setDebugResult(null); },
     [removeCrossEdge],
@@ -346,6 +383,24 @@ export default function App() {
       color:        c.color,
     }));
     applySolution(edges);
+    setCycleHighlight(null);
+    setValidation(null);
+    setMode('manual');
+  }, [applySolution]);
+
+  // Load an N-Cycle result: apply edges + store cycle highlight for rendering.
+  const handleLoadNCycle = useCallback((
+    connections: ConnectionSnapshot[],
+    highlight: CycleHighlight,
+  ) => {
+    const edges: CrossEdge[] = connections.map((c, i) => ({
+      id:           `nc-${i}`,
+      topNodeId:    c.from,
+      bottomNodeId: c.to,
+      color:        c.color,
+    }));
+    applySolution(edges);
+    setCycleHighlight(highlight);
     setValidation(null);
     setMode('manual');
   }, [applySolution]);
@@ -437,7 +492,14 @@ export default function App() {
             </>
           )}
 
-          {/* Cycle glow and ghost edge — behind cross edges and nodes */}
+          {/* Teal glow for cycle cross-edges (N-Cycle preview) — drawn first */}
+          <CycleCrossEdgeGlowLayer
+            crossEdges={crossEdges}
+            topPos={topPos} bottomPos={bottomPos}
+            cycleNodeIds={cycleHighlight?.nodeIds ?? null}
+          />
+
+          {/* Orange glow for offending cycles (rejection feedback) */}
           <CrossEdgeGlowLayer
             crossEdges={crossEdges}
             topPos={topPos} bottomPos={bottomPos}
@@ -463,6 +525,8 @@ export default function App() {
             onNodeClick={mode === 'manual' ? handleClick : () => {}}
             highlightNodeIds={rejection?.highlightNodeIds}
             highlightEdgeKeys={rejection?.highlightEdgeKeys}
+            cycleNodeIds={cycleHighlight?.nodeIds}
+            cycleEdgeKeys={cycleHighlight?.treeEdgeKeys}
           />
           {/* In solo mode we don't render the soloB shadow graph */}
           {!isSolo && (
@@ -472,6 +536,8 @@ export default function App() {
               onNodeClick={mode === 'manual' ? handleClick : () => {}}
               highlightNodeIds={rejection?.highlightNodeIds}
               highlightEdgeKeys={rejection?.highlightEdgeKeys}
+              cycleNodeIds={cycleHighlight?.nodeIds}
+              cycleEdgeKeys={cycleHighlight?.treeEdgeKeys}
             />
           )}
         </svg>
@@ -503,6 +569,12 @@ export default function App() {
           className={`mode-tab${mode === 'random' ? ' mode-tab--active' : ''}`}
           onClick={() => setMode('random')}
         >Random Search</button>
+        {!isSolo && (
+          <button
+            className={`mode-tab${mode === 'ncycle' ? ' mode-tab--active' : ''}`}
+            onClick={() => setMode('ncycle')}
+          >N-Cycle Search</button>
+        )}
       </div>
 
       {/* All panels always mounted; visibility toggled via display:none. */}
@@ -629,6 +701,18 @@ export default function App() {
           onLoadSolution={handleLoadSolution}
         />
       </aside>
+
+      {!isSolo && (
+        <aside className="status-panel search-panel" style={mode !== 'ncycle' ? { display: 'none' } : {}}>
+          <h3>N-Cycle Search</h3>
+          <NCycleSearch
+            gen={gen}
+            topGraph={topGraph}
+            bottomGraph={bottomGraph}
+            onLoadNCycle={handleLoadNCycle}
+          />
+        </aside>
+      )}
     </div>
   );
 }

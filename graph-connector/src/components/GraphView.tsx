@@ -27,11 +27,16 @@ interface GraphViewProps {
   highlightNodeIds?: ReadonlySet<string>;
   /** Canonical edge keys "A|B" for tree edges to highlight orange. */
   highlightEdgeKeys?: ReadonlySet<string>;
+  /** Node IDs that are part of the loaded N-Cycle result (teal ring). */
+  cycleNodeIds?: ReadonlySet<string>;
+  /** Canonical edge keys for tree edges that are part of the cycle (teal glow). */
+  cycleEdgeKeys?: ReadonlySet<string>;
 }
 
 export default function GraphView({
   graph, selectedNodeId, onNodeClick,
   highlightNodeIds, highlightEdgeKeys,
+  cycleNodeIds, cycleEdgeKeys,
 }: GraphViewProps) {
   const nodeById = Object.fromEntries(graph.nodes.map(n => [n.id, n]));
 
@@ -45,9 +50,16 @@ export default function GraphView({
         const ekey = edge.sourceId < edge.targetId
           ? `${edge.sourceId}|${edge.targetId}`
           : `${edge.targetId}|${edge.sourceId}`;
-        const isHighlighted = highlightEdgeKeys?.has(ekey) ?? false;
+        const isHighlighted  = highlightEdgeKeys?.has(ekey) ?? false;
+        const isCycleEdge   = cycleEdgeKeys?.has(ekey) ?? false;
         return (
           <g key={edge.id}>
+            {isCycleEdge && (
+              <line
+                x1={src.x} y1={src.y} x2={tgt.x} y2={tgt.y}
+                stroke="#00c8d8" strokeWidth={11} strokeLinecap="round" opacity={0.35}
+              />
+            )}
             {isHighlighted && (
               <line
                 x1={src.x} y1={src.y} x2={tgt.x} y2={tgt.y}
@@ -69,12 +81,20 @@ export default function GraphView({
       {graph.nodes.map(node => {
         const isSelected    = node.id === selectedNodeId;
         const isHighlighted = highlightNodeIds?.has(node.id) ?? false;
+        const isCycleNode   = cycleNodeIds?.has(node.id) ?? false;
         return (
           <g
             key={node.id}
             onClick={() => onNodeClick(graph.id, node.id)}
             style={{ cursor: 'pointer' }}
           >
+            {isCycleNode && (
+              <circle
+                cx={node.x} cy={node.y}
+                r={NODE_RADIUS + 11}
+                fill="none" stroke="#00c8d8" strokeWidth={2.5} opacity={0.5}
+              />
+            )}
             {isHighlighted && (
               <circle
                 cx={node.x} cy={node.y}
